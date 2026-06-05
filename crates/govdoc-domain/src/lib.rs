@@ -6,4 +6,3 @@ pub use schemas::{
     AnnouncementDoc, CriticReview, DocRequest, DocType, EditRequest, ExternalDoc, GovDoc,
     InternalDoc, OrderDoc, RecipientClass, RenderRequest,
 };
-

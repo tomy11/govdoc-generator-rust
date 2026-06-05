@@ -4,7 +4,8 @@ use serde_json::Value;
 
 #[async_trait]
 pub trait LlmProvider: Send + Sync {
-    async fn complete(&self, system: &str, user: &str, max_tokens: usize) -> anyhow::Result<String>;
+    async fn complete(&self, system: &str, user: &str, max_tokens: usize)
+        -> anyhow::Result<String>;
 
     async fn complete_json(
         &self,
@@ -33,4 +34,3 @@ pub trait MemoryRepository: Send + Sync {
         limit: usize,
     ) -> anyhow::Result<Vec<Value>>;
 }
-

@@ -24,21 +24,16 @@ impl DocType {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RecipientClass {
+    #[default]
     GeneralPublic,
     JuniorOfficial,
     SeniorOfficial,
     Executive,
     Monk,
     Royal,
-}
-
-impl Default for RecipientClass {
-    fn default() -> Self {
-        Self::GeneralPublic
-    }
 }
 
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
@@ -183,4 +178,3 @@ mod tests {
         assert_eq!(req.recipient_class, RecipientClass::GeneralPublic);
     }
 }
-

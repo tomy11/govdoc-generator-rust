@@ -32,7 +32,9 @@ pub async fn edit_document_json(
             .ok_or_else(|| EditError::MissingField(field.clone()))?;
 
         let edited = match value {
-            Value::String(text) => Value::String(edit_scalar(field, &text, edit_instructions, editor).await?),
+            Value::String(text) => {
+                Value::String(edit_scalar(field, &text, edit_instructions, editor).await?)
+            }
             Value::Array(items) => {
                 let paragraphs = items
                     .into_iter()
@@ -63,7 +65,11 @@ async fn edit_scalar(
     let prompt = format!(
         "แก้ไขฟิลด์ '{field}' ต่อไปนี้ตามคำสั่ง:\n{value}\n\nคำสั่งแก้ไข: {instructions}\n\nตอบเฉพาะข้อความที่แก้แล้วเท่านั้น"
     );
-    Ok(editor.complete(EDITOR_SYSTEM_PROMPT, &prompt, 4096).await?.trim().to_string())
+    Ok(editor
+        .complete(EDITOR_SYSTEM_PROMPT, &prompt, 4096)
+        .await?
+        .trim()
+        .to_string())
 }
 
 async fn edit_list(
@@ -84,4 +90,3 @@ async fn edit_list(
         .map(ToOwned::to_owned)
         .collect())
 }
-

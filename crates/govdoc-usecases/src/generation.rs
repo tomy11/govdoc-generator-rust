@@ -18,6 +18,28 @@ pub struct TraceEvent {
     pub detail: Value,
 }
 
+pub struct GenerationServices<'a> {
+    pub generator: &'a dyn LlmProvider,
+    pub critic: &'a dyn LlmProvider,
+    pub memory_repo: &'a dyn MemoryRepository,
+    pub embedding_provider: &'a dyn EmbeddingProvider,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GenerationOptions {
+    pub max_rounds: usize,
+    pub use_critic: bool,
+}
+
+impl Default for GenerationOptions {
+    fn default() -> Self {
+        Self {
+            max_rounds: 3,
+            use_critic: true,
+        }
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum GenerationError {
     #[error("LLM error: {0}")]
@@ -30,15 +52,11 @@ pub enum GenerationError {
 
 pub async fn generate_document_json(
     req: &DocRequest,
-    generator: &dyn LlmProvider,
-    critic: &dyn LlmProvider,
-    memory_repo: &dyn MemoryRepository,
-    embedding_provider: &dyn EmbeddingProvider,
-    max_rounds: usize,
-    use_critic: bool,
+    services: GenerationServices<'_>,
+    options: GenerationOptions,
     trace: &mut Vec<TraceEvent>,
 ) -> Result<Value, GenerationError> {
-    let examples = retrieve_examples(req, memory_repo, embedding_provider).await;
+    let examples = retrieve_examples(req, services.memory_repo, services.embedding_provider).await;
     trace.push(TraceEvent {
         step: "retrieval".to_string(),
         detail: json!({ "examples": examples.len() }),
@@ -46,7 +64,8 @@ pub async fn generate_document_json(
 
     let schema = schema_for_doc_type(&req.doc_type);
     let prompt = build_generator_prompt(req, &examples, &schema);
-    let mut draft = generator
+    let mut draft = services
+        .generator
         .complete_json(GENERATOR_SYSTEM_PROMPT, &prompt, schema.clone(), 8192)
         .await?;
     trace.push(TraceEvent {
@@ -54,11 +73,12 @@ pub async fn generate_document_json(
         detail: json!({ "round": 0, "detail": "ร่างแรก" }),
     });
 
-    if use_critic {
+    if options.use_critic {
         let mut passed = false;
-        for round in 0..max_rounds {
+        for round in 0..options.max_rounds {
             let critic_prompt = build_critic_prompt(&draft, req);
-            let review_raw = critic
+            let review_raw = services
+                .critic
                 .complete_json(
                     CRITIC_SYSTEM_PROMPT,
                     &critic_prompt,
@@ -94,8 +114,14 @@ pub async fn generate_document_json(
                     .collect::<Vec<_>>()
                     .join("\n")
             );
-            draft = generator
-                .complete_json(GENERATOR_SYSTEM_PROMPT, &feedback_prompt, schema.clone(), 8192)
+            draft = services
+                .generator
+                .complete_json(
+                    GENERATOR_SYSTEM_PROMPT,
+                    &feedback_prompt,
+                    schema.clone(),
+                    8192,
+                )
                 .await?;
             trace.push(TraceEvent {
                 step: "generate".to_string(),
@@ -103,7 +129,7 @@ pub async fn generate_document_json(
             });
         }
         if !passed {
-            return Err(GenerationError::CriticLoopExceeded(max_rounds));
+            return Err(GenerationError::CriticLoopExceeded(options.max_rounds));
         }
     } else {
         trace.push(TraceEvent {
@@ -196,10 +222,7 @@ fn build_critic_prompt(doc_json: &Value, req: &DocRequest) -> String {
             "ครบถ้วน: เลขที่, วันที่, เรื่อง, เนื้อความ, ลงชื่อ, ตำแหน่ง",
         ]
     } else {
-        vec![
-            "มีเลขที่ รายการข้อ วันที่ ผู้ลงนาม ตำแหน่ง",
-            "เนื้อความเป็นข้อ ๆ ชัดเจน",
-        ]
+        vec!["มีเลขที่ รายการข้อ วันที่ ผู้ลงนาม ตำแหน่ง", "เนื้อความเป็นข้อ ๆ ชัดเจน"]
     };
 
     let mut parts = vec![

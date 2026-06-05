@@ -8,6 +8,16 @@ pub struct SqliteStore {
     conn: Connection,
 }
 
+pub struct NewMemoryRecord<'a> {
+    pub doc_type: &'a str,
+    pub summary_text: &'a str,
+    pub fields: &'a Value,
+    pub recipient_class: Option<&'a str>,
+    pub agency: Option<&'a str>,
+    pub template_id: Option<&'a str>,
+    pub raw_text: Option<&'a str>,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct TemplateRecord {
     pub id: i64,
@@ -63,16 +73,7 @@ impl SqliteStore {
         Ok(())
     }
 
-    pub fn store_memory(
-        &self,
-        doc_type: &str,
-        summary_text: &str,
-        fields: &Value,
-        recipient_class: Option<&str>,
-        agency: Option<&str>,
-        template_id: Option<&str>,
-        raw_text: Option<&str>,
-    ) -> Result<i64> {
+    pub fn store_memory(&self, record: NewMemoryRecord<'_>) -> Result<i64> {
         self.conn.execute(
             r#"
             INSERT INTO gov_doc_memory (
@@ -81,13 +82,13 @@ impl SqliteStore {
             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
             "#,
             params![
-                doc_type,
-                summary_text,
-                serde_json::to_string(fields)?,
-                recipient_class,
-                agency,
-                template_id,
-                raw_text
+                record.doc_type,
+                record.summary_text,
+                serde_json::to_string(record.fields)?,
+                record.recipient_class,
+                record.agency,
+                record.template_id,
+                record.raw_text
             ],
         )?;
         Ok(self.conn.last_insert_rowid())
@@ -142,11 +143,7 @@ impl SqliteStore {
         self.find_default(doc_type, None)
     }
 
-    fn find_default(
-        &self,
-        doc_type: &str,
-        agency: Option<&str>,
-    ) -> Result<Option<TemplateRecord>> {
+    fn find_default(&self, doc_type: &str, agency: Option<&str>) -> Result<Option<TemplateRecord>> {
         if let Some(agency) = agency {
             return self
                 .conn
@@ -203,15 +200,15 @@ mod tests {
     fn stores_memory_fields_as_json() {
         let store = SqliteStore::open_memory().unwrap();
         let id = store
-            .store_memory(
-                "ภายนอก",
-                "summary",
-                &serde_json::json!({ "subject": "ทดสอบ" }),
-                None,
-                None,
-                None,
-                None,
-            )
+            .store_memory(NewMemoryRecord {
+                doc_type: "ภายนอก",
+                summary_text: "summary",
+                fields: &serde_json::json!({ "subject": "ทดสอบ" }),
+                recipient_class: None,
+                agency: None,
+                template_id: None,
+                raw_text: None,
+            })
             .unwrap();
 
         let fields = store.get_memory_fields(id).unwrap().unwrap();
@@ -235,7 +232,10 @@ mod tests {
             )
             .unwrap();
 
-        let template = store.resolve_default("ภายนอก", Some("โรงเรียน")).unwrap().unwrap();
+        let template = store
+            .resolve_default("ภายนอก", Some("โรงเรียน"))
+            .unwrap()
+            .unwrap();
 
         assert_eq!(template.file_path, "templates/agency.docx");
     }

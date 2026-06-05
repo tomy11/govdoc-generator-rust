@@ -44,4 +44,3 @@ mod tests {
         let _router = router(AppState::default());
     }
 }
-
