@@ -1,15 +1,21 @@
 mod mock;
 
+use std::io::Write;
+use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 
 use axum::{
+    body::Body,
     extract::{Query, State},
-    http::StatusCode,
+    http::{header, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
-use govdoc_domain::{DocRequest, EditRequest};
+use govdoc_domain::{
+    AnnouncementDoc, DocRequest, DocType, EditRequest, ExternalDoc, InternalDoc, OrderDoc,
+    RenderRequest,
+};
 use govdoc_storage::{NewTemplateRecord, SqliteStore, TemplateRecord};
 use govdoc_usecases::{
     edit_document_json, generate_document_json, GenerationOptions, GenerationServices, TraceEvent,
@@ -23,6 +29,8 @@ use crate::mock::{EmptyMemoryRepository, FakeEmbeddingProvider, FakeLlmProvider}
 pub struct AppState {
     pub app_name: String,
     template_store: Arc<Mutex<SqliteStore>>,
+    renderer_cmd: Option<String>,
+    python_source: Option<String>,
 }
 
 impl Default for AppState {
@@ -32,6 +40,8 @@ impl Default for AppState {
             template_store: Arc::new(Mutex::new(
                 SqliteStore::open_memory().expect("in-memory SQLite store should open"),
             )),
+            renderer_cmd: std::env::var("GOVDOC_RENDERER_CMD").ok(),
+            python_source: std::env::var("GOVDOC_PYTHON_SOURCE").ok(),
         }
     }
 }
@@ -47,6 +57,7 @@ pub fn router(state: AppState) -> Router {
         .route("/health", get(health))
         .route("/generate", post(generate))
         .route("/edit", post(edit))
+        .route("/render", post(render))
         .route("/templates", get(list_templates).post(create_template))
         .route("/templates/default", get(resolve_default_template))
         .with_state(state)
@@ -115,6 +126,31 @@ async fn edit(Json(req): Json<EditRequest>) -> Result<Json<Value>, ApiError> {
     })?;
 
     Ok(Json(edited))
+}
+
+async fn render(
+    State(state): State<AppState>,
+    Json(req): Json<RenderRequest>,
+) -> Result<Response, ApiError> {
+    validate_render_doc(&req)?;
+    let template_path = resolve_template_path(&state, &req)?;
+    let docx = render_with_sidecar(&state, &req, template_path.as_deref())?;
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(
+            header::CONTENT_TYPE,
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        )
+        .header(
+            header::CONTENT_DISPOSITION,
+            "attachment; filename=\"govdoc.docx\"",
+        )
+        .body(Body::from(docx))
+        .map_err(|err| ApiError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            detail: err.to_string(),
+        })
 }
 
 #[derive(Debug, Deserialize)]
@@ -248,6 +284,125 @@ fn internal_error(err: anyhow::Error) -> ApiError {
         status: StatusCode::INTERNAL_SERVER_ERROR,
         detail: err.to_string(),
     }
+}
+
+fn validate_render_doc(req: &RenderRequest) -> Result<(), ApiError> {
+    match req.doc_type {
+        DocType::External => serde_json::from_value::<ExternalDoc>(req.doc_data.clone())
+            .map(|_| ())
+            .map_err(bad_render_data),
+        DocType::Internal => serde_json::from_value::<InternalDoc>(req.doc_data.clone())
+            .map(|_| ())
+            .map_err(bad_render_data),
+        DocType::Order => serde_json::from_value::<OrderDoc>(req.doc_data.clone())
+            .map(|_| ())
+            .map_err(bad_render_data),
+        DocType::Announcement => serde_json::from_value::<AnnouncementDoc>(req.doc_data.clone())
+            .map(|_| ())
+            .map_err(bad_render_data),
+    }
+}
+
+fn bad_render_data(err: serde_json::Error) -> ApiError {
+    ApiError {
+        status: StatusCode::BAD_REQUEST,
+        detail: format!("Invalid document data: {err}"),
+    }
+}
+
+fn resolve_template_path(
+    state: &AppState,
+    req: &RenderRequest,
+) -> Result<Option<String>, ApiError> {
+    let Some(template_id) = req.template_id else {
+        return Ok(None);
+    };
+    let store = state.template_store.lock().map_err(|_| ApiError {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        detail: "template store lock poisoned".to_string(),
+    })?;
+    let template = store
+        .get_template(template_id)
+        .map_err(internal_error)?
+        .ok_or_else(|| ApiError {
+            status: StatusCode::NOT_FOUND,
+            detail: format!("Template {template_id} not found"),
+        })?;
+    if template.doc_type != req.doc_type.as_thai() {
+        return Err(ApiError {
+            status: StatusCode::BAD_REQUEST,
+            detail: format!(
+                "Template {template_id} is for {}, not {}",
+                template.doc_type,
+                req.doc_type.as_thai()
+            ),
+        });
+    }
+    Ok(Some(template.file_path))
+}
+
+fn render_with_sidecar(
+    state: &AppState,
+    req: &RenderRequest,
+    template_path: Option<&str>,
+) -> Result<Vec<u8>, ApiError> {
+    let Some(command) = state.renderer_cmd.as_deref() else {
+        return Err(ApiError {
+            status: StatusCode::NOT_IMPLEMENTED,
+            detail: "Renderer sidecar is not configured; set GOVDOC_RENDERER_CMD".to_string(),
+        });
+    };
+
+    let payload = serde_json::json!({
+        "doc_type": req.doc_type.as_thai(),
+        "doc_data": req.doc_data.clone(),
+        "template_path": template_path,
+        "python_source": state.python_source.as_deref(),
+    });
+    let input = serde_json::to_vec(&payload).map_err(|err| ApiError {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        detail: err.to_string(),
+    })?;
+
+    let mut child = Command::new("/bin/sh")
+        .arg("-c")
+        .arg(command)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|err| ApiError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            detail: format!("Failed to start renderer sidecar: {err}"),
+        })?;
+
+    let mut stdin = child.stdin.take().ok_or_else(|| ApiError {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        detail: "Renderer sidecar stdin is unavailable".to_string(),
+    })?;
+    stdin.write_all(&input).map_err(|err| ApiError {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        detail: format!("Failed to write renderer input: {err}"),
+    })?;
+    drop(stdin);
+
+    let output = child.wait_with_output().map_err(|err| ApiError {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        detail: format!("Failed to read renderer output: {err}"),
+    })?;
+    if !output.status.success() {
+        let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(ApiError {
+            status: StatusCode::BAD_GATEWAY,
+            detail: if detail.is_empty() {
+                "Renderer sidecar failed".to_string()
+            } else {
+                detail
+            },
+        });
+    }
+
+    Ok(output.stdout)
 }
 
 #[cfg(test)]
@@ -388,5 +543,42 @@ mod tests {
 
         assert_eq!(json["name"], "กลาง");
         assert_eq!(json["is_default"], true);
+    }
+
+    #[tokio::test]
+    async fn render_requires_configured_sidecar() {
+        let app = router(AppState::default());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/render")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{
+                            "doc_type": "ภายนอก",
+                            "doc_data": {
+                                "doc_type": "ภายนอก",
+                                "number": "ศธ 0000/0001",
+                                "agency": "หน่วยงานตัวอย่าง",
+                                "date": "1 มกราคม 2569",
+                                "subject": "ขอเชิญร่วมงาน",
+                                "recipient": "ผู้ปกครอง",
+                                "salutation": "เรียน",
+                                "reference": [],
+                                "enclosure": [],
+                                "body": ["ย่อหน้าทดสอบ"],
+                                "closing": "ขอแสดงความนับถือ",
+                                "signer_name": "นายสมชาย",
+                                "signer_position": "ผู้อำนวยการ"
+                            }
+                        }"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
     }
 }
