@@ -18,6 +18,14 @@ pub struct NewMemoryRecord<'a> {
     pub raw_text: Option<&'a str>,
 }
 
+pub struct NewTemplateRecord<'a> {
+    pub doc_type: &'a str,
+    pub name: &'a str,
+    pub file_path: &'a str,
+    pub agency: Option<&'a str>,
+    pub is_default: bool,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct TemplateRecord {
     pub id: i64,
@@ -108,25 +116,82 @@ impl SqliteStore {
             .transpose()
     }
 
-    pub fn create_template(
-        &self,
-        doc_type: &str,
-        name: &str,
-        file_path: &str,
-        agency: Option<&str>,
-        is_default: bool,
-    ) -> Result<i64> {
-        if is_default {
-            self.unset_default(doc_type, agency)?;
+    pub fn create_template(&self, record: NewTemplateRecord<'_>) -> Result<i64> {
+        if record.is_default {
+            self.unset_default(record.doc_type, record.agency)?;
         }
         self.conn.execute(
             r#"
             INSERT INTO doc_template (doc_type, agency, name, file_path, is_default)
             VALUES (?1, ?2, ?3, ?4, ?5)
             "#,
-            params![doc_type, agency, name, file_path, is_default as i64],
+            params![
+                record.doc_type,
+                record.agency,
+                record.name,
+                record.file_path,
+                record.is_default as i64
+            ],
         )?;
         Ok(self.conn.last_insert_rowid())
+    }
+
+    pub fn get_template(&self, id: i64) -> Result<Option<TemplateRecord>> {
+        self.conn
+            .query_row(
+                "SELECT id, doc_type, agency, name, file_path, is_default FROM doc_template WHERE id = ?1",
+                params![id],
+                template_from_row,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn list_templates(
+        &self,
+        doc_type: Option<&str>,
+        agency: Option<&str>,
+    ) -> Result<Vec<TemplateRecord>> {
+        let mut templates = Vec::new();
+        match (doc_type, agency) {
+            (Some(doc_type), Some(agency)) => {
+                let mut stmt = self.conn.prepare(
+                    "SELECT id, doc_type, agency, name, file_path, is_default FROM doc_template WHERE doc_type = ?1 AND agency = ?2 ORDER BY id DESC",
+                )?;
+                let rows = stmt.query_map(params![doc_type, agency], template_from_row)?;
+                for row in rows {
+                    templates.push(row?);
+                }
+            }
+            (Some(doc_type), None) => {
+                let mut stmt = self.conn.prepare(
+                    "SELECT id, doc_type, agency, name, file_path, is_default FROM doc_template WHERE doc_type = ?1 ORDER BY id DESC",
+                )?;
+                let rows = stmt.query_map(params![doc_type], template_from_row)?;
+                for row in rows {
+                    templates.push(row?);
+                }
+            }
+            (None, Some(agency)) => {
+                let mut stmt = self.conn.prepare(
+                    "SELECT id, doc_type, agency, name, file_path, is_default FROM doc_template WHERE agency = ?1 ORDER BY id DESC",
+                )?;
+                let rows = stmt.query_map(params![agency], template_from_row)?;
+                for row in rows {
+                    templates.push(row?);
+                }
+            }
+            (None, None) => {
+                let mut stmt = self.conn.prepare(
+                    "SELECT id, doc_type, agency, name, file_path, is_default FROM doc_template ORDER BY id DESC",
+                )?;
+                let rows = stmt.query_map([], template_from_row)?;
+                for row in rows {
+                    templates.push(row?);
+                }
+            }
+        }
+        Ok(templates)
     }
 
     pub fn resolve_default(
@@ -220,16 +285,22 @@ mod tests {
     fn resolves_agency_default_before_central_default() {
         let store = SqliteStore::open_memory().unwrap();
         store
-            .create_template("ภายนอก", "กลาง", "templates/central.docx", None, true)
+            .create_template(NewTemplateRecord {
+                doc_type: "ภายนอก",
+                name: "กลาง",
+                file_path: "templates/central.docx",
+                agency: None,
+                is_default: true,
+            })
             .unwrap();
         store
-            .create_template(
-                "ภายนอก",
-                "หน่วยงาน",
-                "templates/agency.docx",
-                Some("โรงเรียน"),
-                true,
-            )
+            .create_template(NewTemplateRecord {
+                doc_type: "ภายนอก",
+                name: "หน่วยงาน",
+                file_path: "templates/agency.docx",
+                agency: Some("โรงเรียน"),
+                is_default: true,
+            })
             .unwrap();
 
         let template = store
@@ -238,5 +309,24 @@ mod tests {
             .unwrap();
 
         assert_eq!(template.file_path, "templates/agency.docx");
+    }
+
+    #[test]
+    fn lists_templates_by_doc_type() {
+        let store = SqliteStore::open_memory().unwrap();
+        let id = store
+            .create_template(NewTemplateRecord {
+                doc_type: "ภายนอก",
+                name: "กลาง",
+                file_path: "templates/central.docx",
+                agency: None,
+                is_default: true,
+            })
+            .unwrap();
+
+        let templates = store.list_templates(Some("ภายนอก"), None).unwrap();
+
+        assert_eq!(templates.len(), 1);
+        assert_eq!(templates[0].id, id);
     }
 }

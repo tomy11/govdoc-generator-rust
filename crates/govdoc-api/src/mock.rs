@@ -9,10 +9,13 @@ pub struct FakeLlmProvider;
 impl LlmProvider for FakeLlmProvider {
     async fn complete(
         &self,
-        _system: &str,
+        system: &str,
         user: &str,
         _max_tokens: usize,
     ) -> anyhow::Result<String> {
+        if system.contains("แก้ไขหนังสือราชการไทย") {
+            return Ok(fake_edit_from_prompt(user));
+        }
         Ok(user.to_string())
     }
 
@@ -154,4 +157,34 @@ fn extract_prompt_value(prompt: &str, label: &str) -> Option<String> {
             .filter(|value| !value.is_empty())
             .map(ToOwned::to_owned)
     })
+}
+
+fn fake_edit_from_prompt(prompt: &str) -> String {
+    let instructions =
+        extract_prompt_value(prompt, "คำสั่งแก้ไข").unwrap_or_else(|| "แก้ไข".to_string());
+
+    if prompt.contains("แต่ละบรรทัดคือ 1 ย่อหน้า") {
+        return editable_lines(prompt)
+            .into_iter()
+            .map(|line| format!("{line} (แก้ไข: {instructions})"))
+            .collect::<Vec<_>>()
+            .join("\n");
+    }
+
+    editable_lines(prompt)
+        .into_iter()
+        .next()
+        .map(|line| format!("{line} (แก้ไข: {instructions})"))
+        .unwrap_or_else(|| format!("แก้ไขแล้ว: {instructions}"))
+}
+
+fn editable_lines(prompt: &str) -> Vec<String> {
+    prompt
+        .lines()
+        .skip(1)
+        .take_while(|line| !line.starts_with("คำสั่งแก้ไข:"))
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
 }

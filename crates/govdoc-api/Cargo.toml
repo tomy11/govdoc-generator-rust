@@ -9,6 +9,7 @@ anyhow.workspace = true
 async-trait.workspace = true
 axum.workspace = true
 govdoc-domain = { path = "../govdoc-domain" }
+govdoc-storage = { path = "../govdoc-storage" }
 govdoc-usecases = { path = "../govdoc-usecases" }
 serde.workspace = true
 serde_json.workspace = true
