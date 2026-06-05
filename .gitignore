@@ -1,0 +1,22 @@
+/target
+/.env
+/.DS_Store
+*.db
+*.sqlite
+*.sqlite3
+/app-data
+
+# Editor and OS files
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Logs and local runtime state
+*.log
+*.pid
+
+# Desktop build artifacts
+/src-tauri/target
+/dist
+/build
