@@ -232,12 +232,14 @@ name = "govdoc-api"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "axum",
  "govdoc-domain",
  "govdoc-usecases",
  "serde",
  "serde_json",
  "tokio",
+ "tower",
  "tower-http",
  "tracing",
 ]
@@ -275,6 +277,7 @@ dependencies = [
  "async-trait",
  "govdoc-domain",
  "schemars",
+ "serde",
  "serde_json",
  "thiserror",
 ]
