@@ -122,9 +122,33 @@ with the document. With the fake embedding backend the example is still stored
 and surfaced through recency-based retrieval (`embedded: false` in the
 response).
 
-> Note: a hosted Typhoon embeddings endpoint was not confirmed available at the
-> time of writing; the provider targets the OpenAI-compatible contract so it
-> works against Typhoon if/when it ships, or any other compatible service today.
+> Note: Typhoon does not expose a `/v1/embeddings` endpoint, so point `remote`
+> at the local sidecar below or another OpenAI-compatible provider (e.g. OpenAI
+> `text-embedding-3-small`).
+
+### Local embeddings sidecar
+
+`scripts/serve_embeddings.py` serves an OpenAI-compatible `/v1/embeddings`
+endpoint from a local multilingual model (Thai-friendly, no cloud key). Requires
+`sentence-transformers`:
+
+```bash
+python3 -m pip install -U sentence-transformers
+./scripts/serve_embeddings.sh                 # downloads BAAI/bge-m3 on first run
+```
+
+Then point the API at it (e.g. in `.env`):
+
+```bash
+EMBEDDING_BACKEND=remote
+EMBEDDING_BASE_URL=http://127.0.0.1:8090/v1
+EMBEDDING_MODEL=BAAI/bge-m3
+EMBEDDING_DIM=1024
+```
+
+Override the model with `EMBEDDING_LOCAL_MODEL` (e.g.
+`intfloat/multilingual-e5-small` with `EMBEDDING_DIM=384` for a lighter
+footprint).
 
 ## Local Typhoon (MLX) LLM
 

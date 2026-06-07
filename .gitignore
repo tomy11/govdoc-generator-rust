@@ -9,6 +9,9 @@
 # Local model weights (download with scripts/download_model.sh)
 /models
 
+# Local template assets / scratch documents (logos, scanned inputs, etc.)
+/templates
+
 # Editor and OS files
 .idea/
 .vscode/

@@ -1,5 +1,27 @@
 # Progress Log
 
+## 2026-06-07 (later) — Real local embeddings
+
+### Work Completed
+
+- Confirmed Typhoon has no `/v1/embeddings` endpoint (404; chat is 401), so the
+  already-wired `TyphoonEmbeddingProvider` needs a different OpenAI-compatible
+  source. No Rust changes were required — only an endpoint to point at.
+- Added a local embeddings sidecar: `scripts/serve_embeddings.py` serves
+  OpenAI-compatible `POST /v1/embeddings` + `GET /v1/models` from a
+  sentence-transformers model (default `BAAI/bge-m3`, 1024-dim, Thai-friendly,
+  no prefixes). `scripts/serve_embeddings.sh` is the launcher.
+- Verified end to end: bge-m3 cosine ranks a near Thai sentence (0.708) above a
+  far one (0.554); via the Rust API, `/ingest` returns `embedded: true` and
+  `/generate` retrieval reports `examples: 1` over the real vectors.
+- Docs: README "Local embeddings sidecar" section; `.env.example` local config
+  and the Typhoon-has-no-embeddings note.
+
+### Validation
+
+`cargo fmt --all --check` and `cargo test --workspace` (32 tests) still pass; no
+Rust source changed this round.
+
 ## 2026-06-07 (later) — Persistence, dotenv, docs index
 
 ### Work Completed
