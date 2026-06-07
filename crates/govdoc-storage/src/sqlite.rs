@@ -16,6 +16,8 @@ pub struct NewMemoryRecord<'a> {
     pub agency: Option<&'a str>,
     pub template_id: Option<&'a str>,
     pub raw_text: Option<&'a str>,
+    /// Optional dense vector for semantic retrieval, stored as a JSON array.
+    pub embedding: Option<&'a [f32]>,
 }
 
 pub struct NewTemplateRecord<'a> {
@@ -63,6 +65,7 @@ impl SqliteStore {
                 agency TEXT,
                 template_id TEXT,
                 raw_text TEXT,
+                embedding TEXT,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
 
@@ -82,12 +85,14 @@ impl SqliteStore {
     }
 
     pub fn store_memory(&self, record: NewMemoryRecord<'_>) -> Result<i64> {
+        let embedding_json = record.embedding.map(serde_json::to_string).transpose()?;
         self.conn.execute(
             r#"
             INSERT INTO gov_doc_memory (
-                doc_type, summary_text, fields_json, recipient_class, agency, template_id, raw_text
+                doc_type, summary_text, fields_json, recipient_class, agency, template_id,
+                raw_text, embedding
             )
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
             "#,
             params![
                 record.doc_type,
@@ -96,7 +101,8 @@ impl SqliteStore {
                 record.recipient_class,
                 record.agency,
                 record.template_id,
-                record.raw_text
+                record.raw_text,
+                embedding_json
             ],
         )?;
         Ok(self.conn.last_insert_rowid())
@@ -114,6 +120,67 @@ impl SqliteStore {
 
         json.map(|text| serde_json::from_str(&text).map_err(Into::into))
             .transpose()
+    }
+
+    /// Most recent memory `fields_json` values, optionally filtered by doc type.
+    /// Used as the non-vector retrieval fallback.
+    pub fn recent_memory_fields(&self, doc_type: Option<&str>, limit: usize) -> Result<Vec<Value>> {
+        let limit = limit as i64;
+        let rows: Vec<String> = match doc_type {
+            Some(doc_type) => {
+                let mut stmt = self.conn.prepare(
+                    "SELECT fields_json FROM gov_doc_memory WHERE doc_type = ?1 ORDER BY id DESC LIMIT ?2",
+                )?;
+                let mapped = stmt.query_map(params![doc_type, limit], |row| row.get(0))?;
+                mapped.collect::<rusqlite::Result<_>>()?
+            }
+            None => {
+                let mut stmt = self
+                    .conn
+                    .prepare("SELECT fields_json FROM gov_doc_memory ORDER BY id DESC LIMIT ?1")?;
+                let mapped = stmt.query_map(params![limit], |row| row.get(0))?;
+                mapped.collect::<rusqlite::Result<_>>()?
+            }
+        };
+        rows.into_iter()
+            .map(|text| serde_json::from_str(&text).map_err(Into::into))
+            .collect()
+    }
+
+    /// All stored `(id, embedding)` pairs for a doc type, skipping rows without
+    /// an embedding. Used to build the in-memory vector index.
+    pub fn memory_embeddings(&self, doc_type: Option<&str>) -> Result<Vec<(i64, Vec<f32>)>> {
+        let raw: Vec<(i64, String)> = match doc_type {
+            Some(doc_type) => {
+                let mut stmt = self.conn.prepare(
+                    "SELECT id, embedding FROM gov_doc_memory WHERE embedding IS NOT NULL AND doc_type = ?1",
+                )?;
+                let mapped =
+                    stmt.query_map(params![doc_type], |row| Ok((row.get(0)?, row.get(1)?)))?;
+                mapped.collect::<rusqlite::Result<_>>()?
+            }
+            None => {
+                let mut stmt = self.conn.prepare(
+                    "SELECT id, embedding FROM gov_doc_memory WHERE embedding IS NOT NULL",
+                )?;
+                let mapped = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+                mapped.collect::<rusqlite::Result<_>>()?
+            }
+        };
+        raw.into_iter()
+            .map(|(id, json)| Ok((id, serde_json::from_str::<Vec<f32>>(&json)?)))
+            .collect()
+    }
+
+    /// Fetch `fields_json` for the given ids, preserving the input order.
+    pub fn memory_fields_by_ids(&self, ids: &[i64]) -> Result<Vec<Value>> {
+        let mut fields = Vec::with_capacity(ids.len());
+        for &id in ids {
+            if let Some(value) = self.get_memory_fields(id)? {
+                fields.push(value);
+            }
+        }
+        Ok(fields)
     }
 
     pub fn create_template(&self, record: NewTemplateRecord<'_>) -> Result<i64> {
@@ -273,12 +340,62 @@ mod tests {
                 agency: None,
                 template_id: None,
                 raw_text: None,
+                embedding: None,
             })
             .unwrap();
 
         let fields = store.get_memory_fields(id).unwrap().unwrap();
 
         assert_eq!(fields["subject"], "ทดสอบ");
+    }
+
+    #[test]
+    fn stores_and_reads_back_embeddings_per_doc_type() {
+        let store = SqliteStore::open_memory().unwrap();
+        store
+            .store_memory(NewMemoryRecord {
+                doc_type: "ภายนอก",
+                summary_text: "a",
+                fields: &serde_json::json!({ "subject": "ก" }),
+                recipient_class: None,
+                agency: None,
+                template_id: None,
+                raw_text: None,
+                embedding: Some(&[1.0, 0.0, 0.0]),
+            })
+            .unwrap();
+        // Different doc type, and a row without an embedding: both excluded.
+        store
+            .store_memory(NewMemoryRecord {
+                doc_type: "คำสั่ง",
+                summary_text: "b",
+                fields: &serde_json::json!({ "title": "ข" }),
+                recipient_class: None,
+                agency: None,
+                template_id: None,
+                raw_text: None,
+                embedding: Some(&[0.0, 1.0, 0.0]),
+            })
+            .unwrap();
+        store
+            .store_memory(NewMemoryRecord {
+                doc_type: "ภายนอก",
+                summary_text: "c",
+                fields: &serde_json::json!({ "subject": "ค" }),
+                recipient_class: None,
+                agency: None,
+                template_id: None,
+                raw_text: None,
+                embedding: None,
+            })
+            .unwrap();
+
+        let embeddings = store.memory_embeddings(Some("ภายนอก")).unwrap();
+        assert_eq!(embeddings.len(), 1);
+        assert_eq!(embeddings[0].1, vec![1.0, 0.0, 0.0]);
+
+        let recent = store.recent_memory_fields(Some("ภายนอก"), 5).unwrap();
+        assert_eq!(recent.len(), 2);
     }
 
     #[test]

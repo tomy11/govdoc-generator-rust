@@ -1,6 +1,6 @@
 use async_trait::async_trait;
-use govdoc_domain::{DocRequest, DocType};
-use govdoc_usecases::{EmbeddingProvider, LlmProvider, MemoryRepository};
+use govdoc_domain::DocType;
+use govdoc_usecases::{EmbeddingProvider, LlmProvider};
 use serde_json::{json, Value};
 
 pub struct FakeLlmProvider;
@@ -48,24 +48,6 @@ impl EmbeddingProvider for FakeEmbeddingProvider {
 
     fn dimensions(&self) -> usize {
         8
-    }
-}
-
-pub struct EmptyMemoryRepository;
-
-#[async_trait]
-impl MemoryRepository for EmptyMemoryRepository {
-    async fn retrieve(&self, _req: &DocRequest, _limit: usize) -> anyhow::Result<Vec<Value>> {
-        Ok(Vec::new())
-    }
-
-    async fn retrieve_by_similarity(
-        &self,
-        _req: &DocRequest,
-        _embedding: &[f32],
-        _limit: usize,
-    ) -> anyhow::Result<Vec<Value>> {
-        Ok(Vec::new())
     }
 }
 

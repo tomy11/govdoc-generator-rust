@@ -1,8 +1,12 @@
+mod memory;
 mod mock;
+mod providers;
 
 use std::io::Write;
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
+
+use anyhow::Context;
 
 use axum::{
     body::Body,
@@ -18,12 +22,62 @@ use govdoc_domain::{
 };
 use govdoc_storage::{NewTemplateRecord, SqliteStore, TemplateRecord};
 use govdoc_usecases::{
-    edit_document_json, generate_document_json, GenerationOptions, GenerationServices, TraceEvent,
+    edit_document_json, generate_document_json, EmbeddingProvider, GenerationOptions,
+    GenerationServices, LlmProvider, TraceEvent,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::mock::{EmptyMemoryRepository, FakeEmbeddingProvider, FakeLlmProvider};
+use crate::memory::SqliteMemoryRepository;
+use crate::mock::{FakeEmbeddingProvider, FakeLlmProvider};
+use crate::providers::{EmbeddingConfig, TyphoonConfig, TyphoonEmbeddingProvider, TyphoonProvider};
+
+/// Which LLM implementation `/generate` and `/edit` use, resolved once at
+/// startup from the `LLM_BACKEND` environment variable.
+#[derive(Clone, Debug)]
+enum LlmBackend {
+    /// Deterministic in-process stub. Default so tests and offline runs work.
+    Fake,
+    /// Local OpenAI-compatible server (e.g. `mlx_lm.server` with Typhoon MLX).
+    TyphoonLocal(TyphoonConfig),
+    /// Hosted Typhoon cloud API, authenticated with `LLM_API_KEY`.
+    TyphoonCloud(TyphoonConfig),
+}
+
+impl LlmBackend {
+    fn from_env() -> Self {
+        match std::env::var("LLM_BACKEND").as_deref() {
+            Ok("typhoon-cloud") | Ok("cloud") | Ok("key") => {
+                LlmBackend::TyphoonCloud(TyphoonConfig::cloud())
+            }
+            Ok("typhoon-local") | Ok("typhoon") | Ok("local") => {
+                LlmBackend::TyphoonLocal(TyphoonConfig::local())
+            }
+            _ => LlmBackend::Fake,
+        }
+    }
+}
+
+/// Which embedding implementation the retrieval path uses, resolved from
+/// `EMBEDDING_BACKEND`.
+#[derive(Clone, Debug)]
+enum EmbeddingBackend {
+    /// Zero-vector stub. Retrieval then falls back to recency-based lookup.
+    Fake,
+    /// OpenAI-compatible `/v1/embeddings` endpoint (Typhoon cloud, OpenAI, ...).
+    Remote(EmbeddingConfig),
+}
+
+impl EmbeddingBackend {
+    fn from_env() -> Self {
+        match std::env::var("EMBEDDING_BACKEND").as_deref() {
+            Ok("typhoon") | Ok("openai") | Ok("remote") | Ok("cloud") => {
+                EmbeddingBackend::Remote(EmbeddingConfig::from_env())
+            }
+            _ => EmbeddingBackend::Fake,
+        }
+    }
+}
 
 #[derive(Clone)]
 pub struct AppState {
@@ -31,6 +85,8 @@ pub struct AppState {
     template_store: Arc<Mutex<SqliteStore>>,
     renderer_cmd: Option<String>,
     python_source: Option<String>,
+    llm_backend: LlmBackend,
+    embedding_backend: EmbeddingBackend,
 }
 
 impl Default for AppState {
@@ -42,8 +98,92 @@ impl Default for AppState {
             )),
             renderer_cmd: std::env::var("GOVDOC_RENDERER_CMD").ok(),
             python_source: std::env::var("GOVDOC_PYTHON_SOURCE").ok(),
+            llm_backend: LlmBackend::from_env(),
+            embedding_backend: EmbeddingBackend::from_env(),
         }
     }
+}
+
+impl AppState {
+    /// Construct the configured LLM provider for a single request.
+    fn build_llm(&self) -> Result<Box<dyn LlmProvider>, ApiError> {
+        match &self.llm_backend {
+            LlmBackend::Fake => Ok(Box::new(FakeLlmProvider)),
+            LlmBackend::TyphoonLocal(config) => build_typhoon(config),
+            LlmBackend::TyphoonCloud(config) => {
+                if config.api_key.is_none() {
+                    return Err(ApiError {
+                        status: StatusCode::INTERNAL_SERVER_ERROR,
+                        detail: "LLM_BACKEND=typhoon-cloud requires LLM_API_KEY".to_string(),
+                    });
+                }
+                build_typhoon(config)
+            }
+        }
+    }
+
+    /// Construct the configured embedding provider for a single request.
+    fn build_embedding(&self) -> Result<Box<dyn EmbeddingProvider>, ApiError> {
+        match &self.embedding_backend {
+            EmbeddingBackend::Fake => Ok(Box::new(FakeEmbeddingProvider)),
+            EmbeddingBackend::Remote(config) => TyphoonEmbeddingProvider::new(config.clone())
+                .map(|provider| Box::new(provider) as Box<dyn EmbeddingProvider>)
+                .map_err(internal_error),
+        }
+    }
+
+    /// Memory repository over the shared SQLite store.
+    fn memory_repo(&self) -> SqliteMemoryRepository {
+        SqliteMemoryRepository::new(self.template_store.clone())
+    }
+}
+
+fn build_typhoon(config: &TyphoonConfig) -> Result<Box<dyn LlmProvider>, ApiError> {
+    TyphoonProvider::new(config.clone())
+        .map(|provider| Box::new(provider) as Box<dyn LlmProvider>)
+        .map_err(internal_error)
+}
+
+/// Optionally start the local LLM sidecar before the API begins serving.
+///
+/// No-op unless `LLM_AUTO_SERVE` is truthy *and* `LLM_BACKEND` selects the local
+/// Typhoon server. When enabled it spawns `scripts/serve_llm.sh` (override with
+/// `LLM_SERVE_CMD`) and blocks until the server answers, so the first
+/// `/generate` request does not race model loading. The sidecar keeps running
+/// in the background after this returns.
+pub async fn maybe_start_local_llm() -> anyhow::Result<()> {
+    if !env_flag("LLM_AUTO_SERVE") {
+        return Ok(());
+    }
+    if !matches!(LlmBackend::from_env(), LlmBackend::TyphoonLocal(_)) {
+        return Ok(());
+    }
+
+    let config = TyphoonConfig::local();
+    let script =
+        std::env::var("LLM_SERVE_CMD").unwrap_or_else(|_| "scripts/serve_llm.sh".to_string());
+    println!("starting local LLM sidecar: {script}");
+    Command::new("/bin/sh")
+        .arg(&script)
+        .spawn()
+        .with_context(|| format!("failed to start LLM sidecar via {script}"))?;
+
+    let timeout = std::time::Duration::from_secs(
+        std::env::var("LLM_SERVE_TIMEOUT_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(180),
+    );
+    providers::wait_until_ready(&config.base_url, timeout).await?;
+    println!("local LLM server is ready at {}", config.base_url);
+    Ok(())
+}
+
+fn env_flag(name: &str) -> bool {
+    matches!(
+        std::env::var(name).as_deref(),
+        Ok("1") | Ok("true") | Ok("yes")
+    )
 }
 
 #[derive(Debug, Serialize)]
@@ -81,20 +221,22 @@ struct ErrorResponse {
     detail: String,
 }
 
-async fn generate(Json(req): Json<DocRequest>) -> Result<Json<GenerateResponse>, ApiError> {
-    let generator = FakeLlmProvider;
-    let critic = FakeLlmProvider;
-    let memory_repo = EmptyMemoryRepository;
-    let embedding_provider = FakeEmbeddingProvider;
+async fn generate(
+    State(state): State<AppState>,
+    Json(req): Json<DocRequest>,
+) -> Result<Json<GenerateResponse>, ApiError> {
+    let llm = state.build_llm()?;
+    let embedding_provider = state.build_embedding()?;
+    let memory_repo = state.memory_repo();
     let mut trace = Vec::new();
 
     let doc = generate_document_json(
         &req,
         GenerationServices {
-            generator: &generator,
-            critic: &critic,
+            generator: llm.as_ref(),
+            critic: llm.as_ref(),
             memory_repo: &memory_repo,
-            embedding_provider: &embedding_provider,
+            embedding_provider: embedding_provider.as_ref(),
         },
         GenerationOptions {
             max_rounds: 3,
@@ -111,12 +253,15 @@ async fn generate(Json(req): Json<DocRequest>) -> Result<Json<GenerateResponse>,
     Ok(Json(GenerateResponse { doc, trace }))
 }
 
-async fn edit(Json(req): Json<EditRequest>) -> Result<Json<Value>, ApiError> {
-    let editor = FakeLlmProvider;
+async fn edit(
+    State(state): State<AppState>,
+    Json(req): Json<EditRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let editor = state.build_llm()?;
     let edited = edit_document_json(
         req.doc_data,
         &req.edit_instructions,
-        &editor,
+        editor.as_ref(),
         &req.target_fields,
     )
     .await
