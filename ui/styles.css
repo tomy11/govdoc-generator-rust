@@ -10,6 +10,7 @@
 }
 
 * { box-sizing: border-box; }
+[hidden] { display: none !important; }
 
 body {
   margin: 0;
@@ -55,6 +56,23 @@ main {
 }
 .card h2 { margin: 0 0 14px; font-size: 1rem; }
 
+dialog {
+  width: min(760px, calc(100vw - 28px));
+  max-height: min(820px, calc(100vh - 28px));
+  padding: 0;
+  border: 0;
+  border-radius: 12px;
+  background: transparent;
+}
+dialog::backdrop {
+  background: rgba(31, 41, 51, 0.38);
+}
+.modal-card {
+  max-height: min(820px, calc(100vh - 28px));
+  overflow: auto;
+  box-shadow: 0 22px 80px rgba(31, 41, 51, 0.22);
+}
+
 form label {
   display: block;
   font-size: 0.82rem;
@@ -99,6 +117,60 @@ button.ghost {
   font-weight: 500;
 }
 .card.wide { grid-column: 1 / -1; }
+.workspace {
+  scroll-margin-top: 16px;
+}
+.inline-detail {
+  background: #fbfcfd;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 14px;
+}
+.action-msg { margin: -4px 0 10px; min-height: 1em; }
+.action-msg.ok { color: var(--accent); }
+.action-msg.err { color: var(--bad); }
+.edit-wrap {
+  margin-top: 14px;
+  border-top: 1px solid var(--line);
+  padding-top: 12px;
+}
+.edit-wrap summary {
+  cursor: pointer;
+  font-weight: 600;
+  margin-bottom: 10px;
+}
+.edit-wrap label {
+  display: block;
+  font-size: 0.82rem;
+  color: var(--muted);
+  margin-bottom: 10px;
+}
+.edit-actions {
+  flex-wrap: wrap;
+  margin-bottom: 10px;
+}
+.json-editor {
+  min-height: 220px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.8rem;
+  white-space: pre;
+}
+
+.empty-state {
+  border: 1px dashed var(--line);
+  border-radius: 8px;
+  background: #fafbfc;
+  padding: 18px;
+  margin-bottom: 12px;
+}
+.empty-state strong {
+  display: block;
+  margin-bottom: 4px;
+}
+.empty-state span {
+  color: var(--muted);
+  font-size: 0.86rem;
+}
 
 .doc-list { list-style: none; margin: 0; padding: 0; }
 .doc-list li {
@@ -106,25 +178,37 @@ button.ghost {
   align-items: center;
   justify-content: space-between;
   gap: 10px;
-  padding: 9px 4px;
+  padding: 12px 4px;
   border-bottom: 1px solid var(--line);
 }
 .doc-list li:last-child { border-bottom: none; }
-.doc-list .open {
+.doc-list .doc-detail-row {
+  display: block;
+  padding: 0 0 14px 0;
+  border-bottom: 1px solid var(--line);
+}
+.doc-title {
   flex: 1;
-  text-align: left;
-  background: none;
   color: var(--ink);
   font-weight: 500;
-  padding: 2px 0;
+  min-width: 0;
 }
 .doc-list .meta { font-size: 0.74rem; color: var(--muted); font-weight: 400; }
+.doc-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+.doc-actions button {
+  padding: 5px 10px;
+  font-size: 0.8rem;
+}
 .doc-list .del {
   background: transparent;
   color: var(--bad);
   border: 1px solid var(--line);
-  padding: 3px 9px;
-  font-size: 0.8rem;
 }
 
 .small { font-size: 0.78rem; }

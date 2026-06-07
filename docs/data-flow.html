@@ -1,0 +1,552 @@
+<!doctype html>
+<html lang="th">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>GovDoc Generator - Data Flow</title>
+    <style>
+      :root {
+        --bg: #f6f7f9;
+        --panel: #ffffff;
+        --ink: #18222f;
+        --muted: #687386;
+        --line: #d9e0e8;
+        --green: #2f6f4f;
+        --blue: #2d6cdf;
+        --teal: #088f8f;
+        --gold: #a56a00;
+        --red: #b54747;
+        --shadow: 0 18px 55px rgba(24, 34, 47, 0.09);
+      }
+
+      * { box-sizing: border-box; }
+
+      body {
+        margin: 0;
+        font-family: "Sarabun", "Noto Sans Thai", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        color: var(--ink);
+        background:
+          linear-gradient(180deg, rgba(47, 111, 79, 0.10), transparent 330px),
+          var(--bg);
+        line-height: 1.55;
+      }
+
+      header {
+        max-width: 1180px;
+        margin: 0 auto;
+        padding: 40px 24px 18px;
+      }
+
+      h1 {
+        margin: 0;
+        font-size: clamp(2rem, 4vw, 3.7rem);
+        line-height: 1.06;
+        letter-spacing: 0;
+      }
+
+      .subtitle {
+        max-width: 760px;
+        margin: 14px 0 0;
+        color: var(--muted);
+        font-size: 1.02rem;
+      }
+
+      main {
+        max-width: 1180px;
+        margin: 0 auto;
+        padding: 20px 24px 54px;
+      }
+
+      section {
+        margin-top: 24px;
+      }
+
+      .panel {
+        background: rgba(255, 255, 255, 0.92);
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        box-shadow: var(--shadow);
+        padding: 22px;
+      }
+
+      .section-title {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        margin-bottom: 16px;
+      }
+
+      .section-title h2 {
+        margin: 0;
+        font-size: 1.08rem;
+      }
+
+      .tag {
+        display: inline-flex;
+        align-items: center;
+        height: 24px;
+        padding: 0 9px;
+        border-radius: 999px;
+        border: 1px solid var(--line);
+        color: var(--muted);
+        font-size: 0.76rem;
+        background: #fbfcfd;
+      }
+
+      .system-grid {
+        display: grid;
+        grid-template-columns: repeat(4, minmax(0, 1fr));
+        gap: 12px;
+        position: relative;
+      }
+
+      .node {
+        min-height: 108px;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        padding: 14px;
+        background: #fff;
+        position: relative;
+        overflow: hidden;
+      }
+
+      .node::before {
+        content: "";
+        position: absolute;
+        inset: 0 0 auto 0;
+        height: 4px;
+        background: var(--green);
+      }
+
+      .node.blue::before { background: var(--blue); }
+      .node.teal::before { background: var(--teal); }
+      .node.gold::before { background: var(--gold); }
+      .node.red::before { background: var(--red); }
+
+      .node h3 {
+        margin: 4px 0 6px;
+        font-size: 0.98rem;
+      }
+
+      .node p {
+        margin: 0;
+        color: var(--muted);
+        font-size: 0.84rem;
+      }
+
+      .arrow-row {
+        display: grid;
+        grid-template-columns: repeat(4, minmax(0, 1fr));
+        gap: 12px;
+        margin: 10px 0;
+        color: var(--muted);
+        font-size: 0.78rem;
+      }
+
+      .arrow {
+        text-align: center;
+        border-top: 1px dashed #b8c3cf;
+        padding-top: 7px;
+      }
+
+      .flow-lanes {
+        display: grid;
+        grid-template-columns: 1fr;
+        gap: 14px;
+      }
+
+      .lane {
+        display: grid;
+        grid-template-columns: 160px 1fr;
+        gap: 12px;
+        align-items: stretch;
+      }
+
+      .lane-title {
+        border-radius: 8px;
+        padding: 14px;
+        color: #fff;
+        background: var(--green);
+        font-weight: 700;
+        display: flex;
+        align-items: center;
+      }
+
+      .lane:nth-child(2) .lane-title { background: var(--blue); }
+      .lane:nth-child(3) .lane-title { background: var(--teal); }
+      .lane:nth-child(4) .lane-title { background: var(--gold); }
+      .lane:nth-child(5) .lane-title { background: var(--red); }
+
+      .steps {
+        display: flex;
+        gap: 8px;
+        align-items: stretch;
+        overflow-x: auto;
+        padding-bottom: 2px;
+      }
+
+      .step {
+        flex: 0 0 178px;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        background: #fff;
+        padding: 12px;
+        position: relative;
+      }
+
+      .step:not(:last-child)::after {
+        content: "->";
+        position: absolute;
+        right: -17px;
+        top: 50%;
+        transform: translateY(-50%);
+        color: #8a96a8;
+        font-weight: 700;
+      }
+
+      .step strong {
+        display: block;
+        font-size: 0.88rem;
+        margin-bottom: 4px;
+      }
+
+      .step span {
+        display: block;
+        color: var(--muted);
+        font-size: 0.78rem;
+      }
+
+      .endpoint-grid {
+        display: grid;
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+        gap: 12px;
+      }
+
+      .endpoint {
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        background: #fff;
+        padding: 14px;
+      }
+
+      .method {
+        display: inline-flex;
+        align-items: center;
+        height: 22px;
+        padding: 0 8px;
+        border-radius: 5px;
+        color: #fff;
+        font-size: 0.72rem;
+        font-weight: 800;
+        background: var(--green);
+      }
+
+      .method.get { background: var(--blue); }
+      .method.delete { background: var(--red); }
+
+      code {
+        display: block;
+        margin: 9px 0 8px;
+        padding: 8px 9px;
+        border-radius: 6px;
+        background: #f0f3f7;
+        color: #203047;
+        font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        font-size: 0.8rem;
+        overflow-x: auto;
+      }
+
+      .endpoint p {
+        margin: 0;
+        color: var(--muted);
+        font-size: 0.82rem;
+      }
+
+      .storage-map {
+        display: grid;
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+        gap: 12px;
+      }
+
+      .store-box {
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        background: #fff;
+        padding: 14px;
+      }
+
+      .store-box h3 {
+        margin: 0 0 8px;
+        font-size: 0.95rem;
+      }
+
+      ul {
+        margin: 0;
+        padding-left: 18px;
+        color: var(--muted);
+        font-size: 0.84rem;
+      }
+
+      @media (max-width: 940px) {
+        .system-grid,
+        .endpoint-grid,
+        .storage-map {
+          grid-template-columns: repeat(2, minmax(0, 1fr));
+        }
+
+        .lane {
+          grid-template-columns: 1fr;
+        }
+      }
+
+      @media (max-width: 620px) {
+        header,
+        main {
+          padding-left: 16px;
+          padding-right: 16px;
+        }
+
+        .system-grid,
+        .endpoint-grid,
+        .storage-map {
+          grid-template-columns: 1fr;
+        }
+
+        .arrow-row {
+          display: none;
+        }
+
+        .panel {
+          padding: 16px;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <header>
+      <span class="tag">GovDoc Generator Rust</span>
+      <h1>Data Flow Map</h1>
+      <p class="subtitle">
+        ภาพรวมการไหลของข้อมูลจาก Tauri desktop UI ไปยัง API sidecar, storage,
+        LLM/OCR backends และการ export เป็นไฟล์ .docx
+      </p>
+    </header>
+
+    <main>
+      <section class="panel">
+        <div class="section-title">
+          <h2>System Overview</h2>
+          <span class="tag">desktop-first</span>
+        </div>
+
+        <div class="system-grid">
+          <div class="node">
+            <h3>ผู้ใช้</h3>
+            <p>กรอกฟอร์ม สร้างเอกสาร upload ตัวอย่าง และ export .docx</p>
+          </div>
+          <div class="node blue">
+            <h3>Tauri Shell</h3>
+            <p>เปิด static UI และ spawn `govdoc-api` เป็น sidecar</p>
+          </div>
+          <div class="node teal">
+            <h3>Static UI</h3>
+            <p>HTML/CSS/JS เรียก API ผ่าน localhost `127.0.0.1:8000`</p>
+          </div>
+          <div class="node gold">
+            <h3>Axum API</h3>
+            <p>รวม endpoint สำหรับ generate, render, ingest, templates, documents</p>
+          </div>
+        </div>
+
+        <div class="arrow-row">
+          <div class="arrow">desktop interaction</div>
+          <div class="arrow">spawn sidecar</div>
+          <div class="arrow">HTTP localhost</div>
+          <div class="arrow">route handlers</div>
+        </div>
+
+        <div class="system-grid">
+          <div class="node">
+            <h3>Domain</h3>
+            <p>schemas, doc types, Thai government salutation rules</p>
+          </div>
+          <div class="node blue">
+            <h3>Usecases</h3>
+            <p>generate, edit, critic loop, structure OCR text</p>
+          </div>
+          <div class="node teal">
+            <h3>Storage</h3>
+            <p>SQLite source of truth + vector index cache</p>
+          </div>
+          <div class="node red">
+            <h3>External Backends</h3>
+            <p>LLM, embeddings, Typhoon OCR, Python DOCX renderer</p>
+          </div>
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="section-title">
+          <h2>Full Program Flow</h2>
+          <span class="tag">happy paths</span>
+        </div>
+
+        <div class="flow-lanes">
+          <div class="lane">
+            <div class="lane-title">Start App</div>
+            <div class="steps">
+              <div class="step"><strong>Open desktop app</strong><span>Tauri starts</span></div>
+              <div class="step"><strong>Spawn sidecar</strong><span>`govdoc-api` starts</span></div>
+              <div class="step"><strong>Open stores</strong><span>SQLite + vector index</span></div>
+              <div class="step"><strong>Load UI</strong><span>status checks backend</span></div>
+            </div>
+          </div>
+
+          <div class="lane">
+            <div class="lane-title">Generate</div>
+            <div class="steps">
+              <div class="step"><strong>Submit form</strong><span>`POST /generate`</span></div>
+              <div class="step"><strong>Retrieve examples</strong><span>vector or recency</span></div>
+              <div class="step"><strong>Call LLM</strong><span>generate + optional critic</span></div>
+              <div class="step"><strong>Return JSON</strong><span>doc + trace to UI</span></div>
+            </div>
+          </div>
+
+          <div class="lane">
+            <div class="lane-title">Save / Open</div>
+            <div class="steps">
+              <div class="step"><strong>Save result</strong><span>`POST /documents`</span></div>
+              <div class="step"><strong>List history</strong><span>`GET /documents`</span></div>
+              <div class="step"><strong>Open record</strong><span>`GET /documents/:id`</span></div>
+              <div class="step"><strong>Delete record</strong><span>`DELETE /documents/:id`</span></div>
+            </div>
+          </div>
+
+          <div class="lane">
+            <div class="lane-title">Upload Memory</div>
+            <div class="steps">
+              <div class="step"><strong>Upload scan</strong><span>`POST /ingest/ocr/upload`</span></div>
+              <div class="step"><strong>OCR</strong><span>extract raw Thai text</span></div>
+              <div class="step"><strong>Structure</strong><span>LLM maps text to schema</span></div>
+              <div class="step"><strong>Store memory</strong><span>SQLite + vector index</span></div>
+            </div>
+          </div>
+
+          <div class="lane">
+            <div class="lane-title">Render DOCX</div>
+            <div class="steps">
+              <div class="step"><strong>Resolve template</strong><span>default by doc type</span></div>
+              <div class="step"><strong>Run renderer</strong><span>Python sidecar</span></div>
+              <div class="step"><strong>Download file</strong><span>`govdoc.docx`</span></div>
+              <div class="step"><strong>Persist template</strong><span>`POST /templates/upload`</span></div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="section-title">
+          <h2>Endpoint Map</h2>
+          <span class="tag">govdoc-api</span>
+        </div>
+
+        <div class="endpoint-grid">
+          <div class="endpoint">
+            <span class="method get">GET</span>
+            <code>/status</code>
+            <p>รายงาน backend ที่ใช้งานอยู่: LLM, embedding, OCR, renderer, persistence</p>
+          </div>
+          <div class="endpoint">
+            <span class="method">POST</span>
+            <code>/generate</code>
+            <p>รับ `DocRequest`, ดึง examples, เรียก LLM, ส่งกลับ document JSON + trace</p>
+          </div>
+          <div class="endpoint">
+            <span class="method">POST</span>
+            <code>/edit</code>
+            <p>แก้ document JSON ตาม instruction และ optional target fields</p>
+          </div>
+          <div class="endpoint">
+            <span class="method">POST</span>
+            <code>/render</code>
+            <p>resolve template แล้วส่งข้อมูลให้ renderer เพื่อคืนไฟล์ `.docx`</p>
+          </div>
+          <div class="endpoint">
+            <span class="method">POST</span>
+            <code>/ingest</code>
+            <p>เก็บ structured example ลง memory และเพิ่ม vector ถ้ามี embedding</p>
+          </div>
+          <div class="endpoint">
+            <span class="method">POST</span>
+            <code>/ingest/ocr/upload</code>
+            <p>upload รูป/PDF, OCR, structure ด้วย LLM, เก็บเป็นตัวอย่างให้ retrieval</p>
+          </div>
+          <div class="endpoint">
+            <span class="method get">GET</span>
+            <code>/templates</code>
+            <p>list template ตาม `doc_type` หรือ `agency`</p>
+          </div>
+          <div class="endpoint">
+            <span class="method">POST</span>
+            <code>/templates/upload</code>
+            <p>บันทึก `.docx` ลง `GOVDOC_TEMPLATES_DIR` และ register ใน SQLite</p>
+          </div>
+          <div class="endpoint">
+            <span class="method get">GET</span>
+            <code>/templates/default</code>
+            <p>หา default template ตามประเภทเอกสารและหน่วยงาน</p>
+          </div>
+          <div class="endpoint">
+            <span class="method">POST</span>
+            <code>/documents</code>
+            <p>บันทึกผลลัพธ์ generated document ลง SQLite</p>
+          </div>
+          <div class="endpoint">
+            <span class="method get">GET</span>
+            <code>/documents/:id</code>
+            <p>เปิดเอกสารที่เคยบันทึกไว้กลับมาแสดงใน UI</p>
+          </div>
+          <div class="endpoint">
+            <span class="method delete">DELETE</span>
+            <code>/documents/:id</code>
+            <p>ลบ saved document ออกจาก SQLite</p>
+          </div>
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="section-title">
+          <h2>Runtime Data</h2>
+          <span class="tag">ignored from git</span>
+        </div>
+
+        <div class="storage-map">
+          <div class="store-box">
+            <h3>SQLite</h3>
+            <ul>
+              <li>`gov_doc_memory` สำหรับ retrieval examples</li>
+              <li>`doc_template` สำหรับ metadata ของ template</li>
+              <li>`document` สำหรับเอกสารที่บันทึกไว้</li>
+            </ul>
+          </div>
+          <div class="store-box">
+            <h3>Vector Index</h3>
+            <ul>
+              <li>cache จาก embeddings ใน SQLite</li>
+              <li>rebuild ได้เมื่อไฟล์หาย</li>
+              <li>ใช้ค้น examples ที่ใกล้เคียงตอน generate</li>
+            </ul>
+          </div>
+          <div class="store-box">
+            <h3>Templates</h3>
+            <ul>
+              <li>ไฟล์ `.docx` ที่ user upload</li>
+              <li>เก็บใต้ `GOVDOC_TEMPLATES_DIR`</li>
+              <li>ใช้ตอน `POST /render`</li>
+            </ul>
+          </div>
+        </div>
+      </section>
+    </main>
+  </body>
+</html>

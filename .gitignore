@@ -5,6 +5,7 @@
 *.sqlite
 *.sqlite3
 /app-data
+/src-tauri/app-data
 
 # Local model weights (download with scripts/download_model.sh)
 /models

@@ -313,6 +313,21 @@ impl SqliteStore {
         .transpose()
     }
 
+    /// Replace a saved document. Returns whether a row was updated.
+    pub fn update_document(
+        &self,
+        id: i64,
+        doc_type: &str,
+        title: Option<&str>,
+        doc_json: &Value,
+    ) -> Result<bool> {
+        let affected = self.conn.execute(
+            "UPDATE document SET doc_type = ?1, title = ?2, doc_json = ?3 WHERE id = ?4",
+            params![doc_type, title, serde_json::to_string(doc_json)?, id],
+        )?;
+        Ok(affected > 0)
+    }
+
     /// Delete a saved document. Returns whether a row was removed.
     pub fn delete_document(&self, id: i64) -> Result<bool> {
         let affected = self
@@ -620,6 +635,26 @@ mod tests {
 
         let doc = store.get_document(id).unwrap().unwrap();
         assert_eq!(doc.doc_json["subject"], "ขอเชิญประชุม");
+
+        assert!(store
+            .update_document(
+                id,
+                "ภายนอก",
+                Some("ขอเชิญประชุมฉบับแก้ไข"),
+                &serde_json::json!({ "subject": "ขอเชิญประชุมฉบับแก้ไข" }),
+            )
+            .unwrap());
+        let updated = store.get_document(id).unwrap().unwrap();
+        assert_eq!(updated.title.as_deref(), Some("ขอเชิญประชุมฉบับแก้ไข"));
+        assert_eq!(updated.doc_json["subject"], "ขอเชิญประชุมฉบับแก้ไข");
+        assert!(!store
+            .update_document(
+                999,
+                "ภายนอก",
+                Some("ไม่มี"),
+                &serde_json::json!({ "subject": "ไม่มี" }),
+            )
+            .unwrap());
 
         assert!(store.delete_document(id).unwrap());
         assert!(!store.delete_document(id).unwrap()); // already gone

@@ -13,67 +13,88 @@
     </header>
 
     <main>
-      <section class="card">
-        <h2>สร้างหนังสือ</h2>
-        <form id="gen-form">
-          <div class="row">
-            <label>ประเภท
-              <select name="doc_type">
-                <option value="ภายนอก">หนังสือภายนอก</option>
-                <option value="ภายใน">หนังสือภายใน</option>
-                <option value="คำสั่ง">คำสั่ง</option>
-                <option value="ประกาศ">ประกาศ</option>
-              </select>
-            </label>
-            <label>ระดับผู้รับ
-              <select name="recipient_class">
-                <option value="general">ทั่วไป</option>
-                <option value="executive">ผู้บริหาร</option>
-                <option value="monk">พระสงฆ์</option>
-                <option value="royal">พระราชวงศ์</option>
-              </select>
-            </label>
+      <section class="card wide" id="documents-section">
+        <div class="row between">
+          <h2>เอกสารที่บันทึกไว้</h2>
+          <div class="btn-group">
+            <button id="new-doc-btn">สร้างเอกสารใหม่</button>
+            <button id="refresh-docs" class="ghost">รีเฟรช</button>
           </div>
-
-          <label>เรื่อง
-            <input name="subject" placeholder="เช่น ขอเชิญร่วมงานวันเด็กแห่งชาติ" required />
-          </label>
-          <label>จุดประสงค์
-            <input name="purpose" placeholder="เช่น แจ้งกำหนดการและขอความร่วมมือ" />
-          </label>
-
-          <div class="row">
-            <label>ผู้รับ
-              <input name="recipient_name" placeholder="เช่น ผู้อำนวยการเขตพื้นที่" />
-            </label>
-            <label>หน่วยงานผู้รับ
-              <input name="recipient_agency" placeholder="(ถ้ามี)" />
-            </label>
-          </div>
-
-          <div class="row">
-            <label>ผู้ลงนาม
-              <input name="sender_name" placeholder="เช่น นายสมชาย รักเรียน" />
-            </label>
-            <label>ตำแหน่ง
-              <input name="sender_position" placeholder="เช่น ผู้อำนวยการโรงเรียน" />
-            </label>
-          </div>
-
-          <label>บริบทเพิ่มเติม
-            <textarea name="additional_context" rows="2" placeholder="(ถ้ามี)"></textarea>
-          </label>
-
-          <div class="row between">
-            <label class="checkbox">
-              <input type="checkbox" name="use_critic" /> ตรวจทานด้วย critic (ช้ากว่า)
-            </label>
-            <button type="submit" id="gen-btn">สร้างหนังสือ</button>
-          </div>
-        </form>
+        </div>
+        <div id="doc-empty" class="empty-state" hidden>
+          <strong>ยังไม่มีเอกสารที่บันทึกไว้</strong>
+          <span>เริ่มจากสร้างเอกสารใหม่ แล้วกด “บันทึกเก็บไว้” เพื่อให้รายการแสดงตรงนี้</span>
+        </div>
+        <div id="draft-slot"></div>
+        <ul id="doc-list" class="doc-list"><li class="muted">กำลังโหลด…</li></ul>
       </section>
 
-      <section class="card">
+      <dialog id="create-modal">
+        <section class="card modal-card" id="create-section">
+          <div class="row between">
+            <h2>สร้างหนังสือ</h2>
+            <button id="close-create-btn" class="ghost" type="button">ปิด</button>
+          </div>
+          <form id="gen-form">
+            <div class="row">
+              <label>ประเภท
+                <select name="doc_type">
+                  <option value="ภายนอก">หนังสือภายนอก</option>
+                  <option value="ภายใน">หนังสือภายใน</option>
+                  <option value="คำสั่ง">คำสั่ง</option>
+                  <option value="ประกาศ">ประกาศ</option>
+                </select>
+              </label>
+              <label>ระดับผู้รับ
+                <select name="recipient_class">
+                  <option value="general">ทั่วไป</option>
+                  <option value="executive">ผู้บริหาร</option>
+                  <option value="monk">พระสงฆ์</option>
+                  <option value="royal">พระราชวงศ์</option>
+                </select>
+              </label>
+            </div>
+
+            <label>เรื่อง
+              <input name="subject" placeholder="เช่น ขอเชิญร่วมงานวันเด็กแห่งชาติ" required />
+            </label>
+            <label>จุดประสงค์
+              <input name="purpose" placeholder="เช่น แจ้งกำหนดการและขอความร่วมมือ" />
+            </label>
+
+            <div class="row">
+              <label>ผู้รับ
+                <input name="recipient_name" placeholder="เช่น ผู้อำนวยการเขตพื้นที่" />
+              </label>
+              <label>หน่วยงานผู้รับ
+                <input name="recipient_agency" placeholder="(ถ้ามี)" />
+              </label>
+            </div>
+
+            <div class="row">
+              <label>ผู้ลงนาม
+                <input name="sender_name" placeholder="เช่น นายสมชาย รักเรียน" />
+              </label>
+              <label>ตำแหน่ง
+                <input name="sender_position" placeholder="เช่น ผู้อำนวยการโรงเรียน" />
+              </label>
+            </div>
+
+            <label>บริบทเพิ่มเติม
+              <textarea name="additional_context" rows="2" placeholder="(ถ้ามี)"></textarea>
+            </label>
+
+            <div class="row between">
+              <label class="checkbox">
+                <input type="checkbox" name="use_critic" /> ตรวจทานด้วย critic (ช้ากว่า)
+              </label>
+              <button type="submit" id="gen-btn">สร้างหนังสือ</button>
+            </div>
+          </form>
+        </section>
+      </dialog>
+
+      <section class="workspace inline-detail" id="result-section" hidden>
         <div class="row between">
           <h2>ผลลัพธ์</h2>
           <div class="btn-group">
@@ -81,19 +102,25 @@
             <button id="render-btn" disabled>เป็น .docx</button>
           </div>
         </div>
+        <div id="render-msg" class="action-msg muted small"></div>
         <div id="result" class="result muted">ยังไม่มีผลลัพธ์ — กรอกฟอร์มแล้วกด “สร้างหนังสือ”</div>
+        <details id="edit-wrap" class="edit-wrap" hidden>
+          <summary>แก้ไขเอกสาร</summary>
+          <label>คำสั่งแก้ด้วย AI
+            <textarea id="ai-edit-instructions" rows="2" placeholder="เช่น ปรับให้เป็นทางการขึ้น และเพิ่มกำหนดส่งภายใน 15 วัน"></textarea>
+          </label>
+          <div class="row between edit-actions">
+            <button id="ai-edit-btn" type="button">แก้ด้วย AI</button>
+            <button id="apply-json-btn" type="button" class="ghost">ใช้ JSON ด้านล่าง</button>
+            <button id="overwrite-btn" type="button" disabled>บันทึกทับ</button>
+          </div>
+          <textarea id="doc-json-editor" class="json-editor" rows="12" spellcheck="false"></textarea>
+          <div id="edit-msg" class="action-msg muted small"></div>
+        </details>
         <details id="trace-wrap" hidden>
           <summary>ขั้นตอนการทำงาน (trace)</summary>
           <pre id="trace"></pre>
         </details>
-      </section>
-
-      <section class="card wide">
-        <div class="row between">
-          <h2>เอกสารที่บันทึกไว้</h2>
-          <button id="refresh-docs" class="ghost">รีเฟรช</button>
-        </div>
-        <ul id="doc-list" class="doc-list"><li class="muted">กำลังโหลด…</li></ul>
       </section>
 
       <section class="card wide">

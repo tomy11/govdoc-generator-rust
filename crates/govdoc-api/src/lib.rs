@@ -3,7 +3,7 @@ mod mock;
 mod providers;
 
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path as FsPath, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex, RwLock};
 
@@ -106,12 +106,66 @@ impl Default for AppState {
             app_name: "govdoc-generator-rust".to_string(),
             template_store,
             vector_index,
-            renderer_cmd: std::env::var("GOVDOC_RENDERER_CMD").ok(),
-            python_source: std::env::var("GOVDOC_PYTHON_SOURCE").ok(),
+            renderer_cmd: renderer_cmd_from_env(),
+            python_source: optional_env_or_existing_path(
+                "GOVDOC_PYTHON_SOURCE",
+                ["../govdoc-generator"],
+            ),
             llm_backend: LlmBackend::from_env(),
             embedding_backend: EmbeddingBackend::from_env(),
         }
     }
+}
+
+fn optional_env(name: &str) -> Option<String> {
+    std::env::var(name).ok().filter(|value| !value.is_empty())
+}
+
+fn optional_env_or_existing_path<const N: usize>(
+    name: &str,
+    fallbacks: [&str; N],
+) -> Option<String> {
+    optional_env(name).or_else(|| {
+        fallbacks
+            .into_iter()
+            .find_map(|path| resolve_existing_path(path).map(|path| path.display().to_string()))
+    })
+}
+
+fn renderer_cmd_from_env() -> Option<String> {
+    optional_env("GOVDOC_RENDERER_CMD").or_else(|| {
+        resolve_existing_path("scripts/render_docx_sidecar.py")
+            .map(|script| format!("python3 {}", shell_quote_path(&script)))
+    })
+}
+
+fn resolve_existing_path(relative: &str) -> Option<PathBuf> {
+    let path = FsPath::new(relative);
+    if path.is_absolute() && path.exists() {
+        return Some(path.to_path_buf());
+    }
+
+    let mut bases = vec![std::env::current_dir().ok()];
+    if let Ok(exe) = std::env::current_exe() {
+        let mut cursor = exe.parent();
+        while let Some(dir) = cursor {
+            bases.push(Some(dir.to_path_buf()));
+            cursor = dir.parent();
+        }
+    }
+    bases.push(Some(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../.."),
+    ));
+
+    bases.into_iter().flatten().find_map(|base| {
+        let candidate = base.join(relative);
+        candidate.exists().then_some(candidate)
+    })
+}
+
+fn shell_quote_path(path: &FsPath) -> String {
+    let path = path.display().to_string();
+    format!("'{}'", path.replace('\'', "'\\''"))
 }
 
 /// Open the persistent store at `SQLITE_PATH`, creating parent dirs as needed.
@@ -278,6 +332,7 @@ pub fn router(state: AppState) -> Router {
         .route("/generate", post(generate))
         .route("/edit", post(edit))
         .route("/render", post(render))
+        .route("/render/save", post(render_save))
         .route("/ingest", post(ingest))
         .route("/ingest/ocr", post(ingest_ocr))
         .route("/ingest/ocr/upload", post(ingest_ocr_upload))
@@ -285,7 +340,12 @@ pub fn router(state: AppState) -> Router {
         .route("/templates/upload", post(upload_template))
         .route("/templates/default", get(resolve_default_template))
         .route("/documents", get(list_documents).post(save_document))
-        .route("/documents/:id", get(get_document).delete(delete_document))
+        .route(
+            "/documents/:id",
+            get(get_document)
+                .put(update_document)
+                .delete(delete_document),
+        )
         // Allow up to 25 MB uploads (scanned PDFs, .docx templates).
         .layer(DefaultBodyLimit::max(25 * 1024 * 1024))
         // Permissive CORS: the API binds to localhost only and is consumed by
@@ -339,12 +399,14 @@ async fn api_index() -> Json<Value> {
             { "method": "POST", "path": "/generate",          "body": "DocRequest",    "desc": "Generate a Thai government document" },
             { "method": "POST", "path": "/edit",              "body": "EditRequest",   "desc": "Edit document fields" },
             { "method": "POST", "path": "/render",            "body": "RenderRequest", "desc": "Render a document to .docx via the sidecar" },
+            { "method": "POST", "path": "/render/save",       "body": "RenderRequest", "desc": "Render a document and save it to disk" },
             { "method": "POST", "path": "/ingest",            "body": "IngestRequest", "desc": "Store a structured example in memory" },
             { "method": "POST", "path": "/ingest/ocr",        "body": "IngestOcrRequest", "desc": "OCR a local file into a memory example" },
             { "method": "POST", "path": "/ingest/ocr/upload", "body": "multipart (file, doc_type)", "desc": "Upload + OCR a scan into a memory example" },
             { "method": "POST", "path": "/documents",         "body": "SaveDocumentRequest", "desc": "Save a generated document" },
             { "method": "GET",  "path": "/documents",         "query": "doc_type", "desc": "List saved documents (newest first)" },
             { "method": "GET",  "path": "/documents/:id",     "desc": "Get one saved document" },
+            { "method": "PUT",  "path": "/documents/:id",     "body": "SaveDocumentRequest", "desc": "Replace one saved document" },
             { "method": "DELETE","path": "/documents/:id",    "desc": "Delete a saved document" },
             { "method": "GET",  "path": "/templates",         "query": "doc_type, agency", "desc": "List templates" },
             { "method": "POST", "path": "/templates",         "body": "TemplateCreateRequest", "desc": "Register a template by file path" },
@@ -824,6 +886,27 @@ async fn render(
         })
 }
 
+#[derive(Debug, Serialize)]
+struct RenderSaveResponse {
+    file_path: String,
+    bytes: usize,
+}
+
+async fn render_save(
+    State(state): State<AppState>,
+    Json(req): Json<RenderRequest>,
+) -> Result<Json<RenderSaveResponse>, ApiError> {
+    validate_render_doc(&req)?;
+    let template_path = resolve_template_path(&state, &req)?;
+    let docx = render_with_sidecar(&state, &req, template_path.as_deref())?;
+    let file_path = save_docx_to_disk(&docx)?;
+
+    Ok(Json(RenderSaveResponse {
+        file_path: file_path.display().to_string(),
+        bytes: docx.len(),
+    }))
+}
+
 #[derive(Debug, Deserialize)]
 struct TemplateCreateRequest {
     doc_type: String,
@@ -992,6 +1075,29 @@ async fn get_document(
     Ok(Json(document.into()))
 }
 
+async fn update_document(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Json(req): Json<SaveDocumentRequest>,
+) -> Result<Json<SavedResponse>, ApiError> {
+    let store = lock_store(&state)?;
+    let updated = store
+        .update_document(
+            id,
+            req.doc_type.as_thai(),
+            req.title.as_deref(),
+            &req.doc_data,
+        )
+        .map_err(internal_error)?;
+    if !updated {
+        return Err(ApiError {
+            status: StatusCode::NOT_FOUND,
+            detail: format!("Document {id} not found"),
+        });
+    }
+    Ok(Json(SavedResponse { id }))
+}
+
 async fn delete_document(
     State(state): State<AppState>,
     Path(id): Path<i64>,
@@ -1096,6 +1202,42 @@ fn bad_render_data(err: serde_json::Error) -> ApiError {
         status: StatusCode::BAD_REQUEST,
         detail: format!("Invalid document data: {err}"),
     }
+}
+
+fn save_docx_to_disk(docx: &[u8]) -> Result<PathBuf, ApiError> {
+    let dir = render_exports_dir();
+    std::fs::create_dir_all(&dir).map_err(io_error)?;
+    let path = unique_export_path(&dir);
+    std::fs::write(&path, docx).map_err(io_error)?;
+    Ok(path)
+}
+
+fn render_exports_dir() -> PathBuf {
+    if let Some(path) = optional_env("GOVDOC_EXPORTS_DIR") {
+        return PathBuf::from(path);
+    }
+    if let Some(home) = optional_env("HOME") {
+        let downloads = PathBuf::from(home).join("Downloads");
+        if downloads.exists() {
+            return downloads;
+        }
+    }
+    PathBuf::from("app-data/exports")
+}
+
+fn unique_export_path(dir: &FsPath) -> PathBuf {
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let base = format!("govdoc-{millis}");
+    let mut path = dir.join(format!("{base}.docx"));
+    let mut counter = 2;
+    while path.exists() {
+        path = dir.join(format!("{base}-{counter}.docx"));
+        counter += 1;
+    }
+    path
 }
 
 fn resolve_template_path(
@@ -1496,6 +1638,39 @@ mod tests {
         let json: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["doc_data"]["subject"], "ขอเชิญประชุม");
 
+        // update
+        let update = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri(format!("/documents/{id}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"doc_type":"ภายนอก","title":"ขอเชิญประชุมฉบับแก้ไข","doc_data":{"subject":"ขอเชิญประชุมฉบับแก้ไข"}}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(update.status(), StatusCode::OK);
+
+        let get_updated = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(format!("/documents/{id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = to_bytes(get_updated.into_body(), usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["title"], "ขอเชิญประชุมฉบับแก้ไข");
+        assert_eq!(json["doc_data"]["subject"], "ขอเชิญประชุมฉบับแก้ไข");
+
         // delete
         let del = app
             .clone()
@@ -1526,7 +1701,9 @@ mod tests {
 
     #[tokio::test]
     async fn render_requires_configured_sidecar() {
-        let app = router(AppState::default());
+        let mut state = AppState::default();
+        state.renderer_cmd = None;
+        let app = router(state);
         let response = app
             .oneshot(
                 Request::builder()
