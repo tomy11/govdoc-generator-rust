@@ -117,6 +117,11 @@ Add examples that `/generate` can retrieve:
   { "file_path": "/path/to/scan.pdf", "doc_type": "ภายนอก" }
   ```
 
+  An LLM pass (the configured `LLM_BACKEND`) parses the OCR text into the
+  document schema so the stored example is structured rather than a raw blob;
+  on any failure it falls back to storing the raw text. The response reports
+  `structured: true|false`. Pass `"structure": false` to skip the LLM pass.
+
 Each ingest embeds the summary (when `EMBEDDING_BACKEND=remote`) and stores it
 with the document. With the fake embedding backend the example is still stored
 and surfaced through recency-based retrieval (`embedded: false` in the

@@ -1,5 +1,26 @@
 # Progress Log
 
+## 2026-06-07 (later) — Structure OCR text via LLM
+
+### Work Completed
+
+- Added `structure_document_from_text` (usecases) that runs an LLM pass to parse
+  free OCR text into the per-doc-type schema and validates the result, reusing
+  the same `complete_json` + schema-validation path as generation. Unit tested
+  with a stub LLM for both the success and invalid-schema (fallback) cases.
+- `POST /ingest/ocr` now structures the OCR text by default: on success it stores
+  schema-shaped fields and derives the embedding summary from them; on any
+  failure it falls back to the raw-text example. Response gained `structured`,
+  and the request accepts `structure: false` to opt out.
+- Docs: README ingestion note on the LLM structuring pass and opt-out.
+
+### Validation
+
+`cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D
+warnings`, and `cargo test --workspace` (33 tests, 0 failures) all pass. The
+structuring path uses the same mechanism already proven live in the local-MLX
+`/generate` run, so no new live model run was required.
+
 ## 2026-06-07 (later) — Real local embeddings
 
 ### Work Completed

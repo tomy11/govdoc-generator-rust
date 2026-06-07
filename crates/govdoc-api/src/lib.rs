@@ -22,8 +22,8 @@ use govdoc_domain::{
 };
 use govdoc_storage::{NewMemoryRecord, NewTemplateRecord, SqliteStore, TemplateRecord};
 use govdoc_usecases::{
-    edit_document_json, generate_document_json, EmbeddingProvider, GenerationOptions,
-    GenerationServices, LlmProvider, TraceEvent,
+    edit_document_json, generate_document_json, structure_document_from_text, EmbeddingProvider,
+    GenerationOptions, GenerationServices, LlmProvider, TraceEvent,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -365,6 +365,14 @@ struct IngestOcrRequest {
     doc_type: DocType,
     agency: Option<String>,
     recipient_class: Option<String>,
+    /// Run an LLM pass to parse the OCR text into the document schema. Defaults
+    /// to true; set false to store the raw text instead.
+    #[serde(default = "default_true")]
+    structure: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Serialize)]
@@ -372,6 +380,9 @@ struct IngestResponse {
     id: i64,
     /// Whether a real embedding was stored (false on the fake backend).
     embedded: bool,
+    /// Whether the stored fields were structured into the document schema
+    /// (false means raw OCR text was stored as a fallback).
+    structured: bool,
 }
 
 /// Store a structured example document in memory for retrieval.
@@ -397,10 +408,12 @@ async fn ingest(
     Ok(Json(IngestResponse {
         id,
         embedded: embedding.is_some(),
+        structured: true,
     }))
 }
 
-/// OCR a local file, then store its text as a memory example.
+/// OCR a local file, then store its text as a memory example. Unless disabled,
+/// an LLM pass parses the text into the document schema first.
 async fn ingest_ocr(
     State(state): State<AppState>,
     Json(req): Json<IngestOcrRequest>,
@@ -424,13 +437,32 @@ async fn ingest_ocr(
             detail: format!("OCR failed: {err}"),
         })?;
 
-    let summary = truncate_chars(&text, 2000);
+    // Best-effort: structure the OCR text into the document schema. On any
+    // failure, fall back to storing the raw text as a content example.
+    let mut structured_fields = None;
+    if req.structure {
+        let llm = state.build_llm()?;
+        if let Ok(fields) = structure_document_from_text(&req.doc_type, &text, llm.as_ref()).await {
+            structured_fields = Some(fields);
+        }
+    }
+
+    let (fields, summary, structured) = match structured_fields {
+        Some(fields) => {
+            let summary = derive_summary(req.doc_type, &fields);
+            (fields, summary, true)
+        }
+        None => {
+            let fields = serde_json::json!({
+                "doc_type": req.doc_type.as_thai(),
+                "content": text,
+                "source": filename,
+            });
+            (fields, truncate_chars(&text, 2000), false)
+        }
+    };
+
     let embedding = state.embed_for_storage(&summary).await?;
-    let fields = serde_json::json!({
-        "doc_type": req.doc_type.as_thai(),
-        "content": text,
-        "source": filename,
-    });
     let id = store_memory_record(
         &state,
         req.doc_type,
@@ -444,6 +476,7 @@ async fn ingest_ocr(
     Ok(Json(IngestResponse {
         id,
         embedded: embedding.is_some(),
+        structured,
     }))
 }
 
