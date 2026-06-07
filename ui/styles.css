@@ -90,6 +90,42 @@ button {
   cursor: pointer;
 }
 button:disabled { opacity: 0.5; cursor: not-allowed; }
+.btn-group { display: flex; gap: 8px; }
+button.ghost {
+  background: transparent;
+  color: var(--accent);
+  border: 1px solid var(--line);
+  padding: 6px 12px;
+  font-weight: 500;
+}
+.card.wide { grid-column: 1 / -1; }
+
+.doc-list { list-style: none; margin: 0; padding: 0; }
+.doc-list li {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 9px 4px;
+  border-bottom: 1px solid var(--line);
+}
+.doc-list li:last-child { border-bottom: none; }
+.doc-list .open {
+  flex: 1;
+  text-align: left;
+  background: none;
+  color: var(--ink);
+  font-weight: 500;
+  padding: 2px 0;
+}
+.doc-list .meta { font-size: 0.74rem; color: var(--muted); font-weight: 400; }
+.doc-list .del {
+  background: transparent;
+  color: var(--bad);
+  border: 1px solid var(--line);
+  padding: 3px 9px;
+  font-size: 0.8rem;
+}
 
 .muted { color: var(--muted); }
 .result {

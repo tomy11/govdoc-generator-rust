@@ -80,6 +80,7 @@ The local API currently exposes:
 - `POST /render`
 - `POST /ingest`
 - `POST /ingest/ocr`
+- `POST /documents` · `GET /documents` · `GET /documents/:id` · `DELETE /documents/:id`
 - `GET /templates`
 - `POST /templates`
 - `GET /templates/default`

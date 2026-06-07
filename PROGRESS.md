@@ -1,5 +1,24 @@
 # Progress Log
 
+## 2026-06-07 (later) — Document persistence
+
+### Work Completed
+
+- Added a `document` table and CRUD on `SqliteStore` (`save_document`,
+  `list_documents`, `get_document`, `delete_document`) with a storage test.
+- API endpoints: `POST /documents` (save a generated doc), `GET /documents`
+  (list, newest first, optional `doc_type`), `GET /documents/:id`,
+  `DELETE /documents/:id`. Listed in `/docs`; integration tested.
+- UI: a "บันทึกเก็บไว้" button on the result, plus a "เอกสารที่บันทึกไว้" panel
+  that lists saved documents and lets you reopen or delete them.
+- Saved documents persist via `SQLITE_PATH`. Verified live: save -> list ->
+  restart (still there) -> get -> delete (204).
+
+### Validation
+
+`cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D
+warnings`, and `cargo test --workspace` (37 tests, 0 failures) all pass.
+
 ## 2026-06-07 (later) — Tauri desktop shell (sidecar)
 
 ### Work Completed

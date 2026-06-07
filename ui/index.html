@@ -76,13 +76,24 @@
       <section class="card">
         <div class="row between">
           <h2>ผลลัพธ์</h2>
-          <button id="render-btn" disabled>บันทึกเป็น .docx</button>
+          <div class="btn-group">
+            <button id="save-btn" disabled>บันทึกเก็บไว้</button>
+            <button id="render-btn" disabled>เป็น .docx</button>
+          </div>
         </div>
         <div id="result" class="result muted">ยังไม่มีผลลัพธ์ — กรอกฟอร์มแล้วกด “สร้างหนังสือ”</div>
         <details id="trace-wrap" hidden>
           <summary>ขั้นตอนการทำงาน (trace)</summary>
           <pre id="trace"></pre>
         </details>
+      </section>
+
+      <section class="card wide">
+        <div class="row between">
+          <h2>เอกสารที่บันทึกไว้</h2>
+          <button id="refresh-docs" class="ghost">รีเฟรช</button>
+        </div>
+        <ul id="doc-list" class="doc-list"><li class="muted">กำลังโหลด…</li></ul>
       </section>
     </main>
 

@@ -38,6 +38,25 @@ pub struct TemplateRecord {
     pub is_default: bool,
 }
 
+/// A saved generated document (full content).
+#[derive(Clone, Debug, PartialEq)]
+pub struct DocumentRecord {
+    pub id: i64,
+    pub doc_type: String,
+    pub title: Option<String>,
+    pub doc_json: Value,
+    pub created_at: String,
+}
+
+/// Lightweight row for listing saved documents.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DocumentSummary {
+    pub id: i64,
+    pub doc_type: String,
+    pub title: Option<String>,
+    pub created_at: String,
+}
+
 impl SqliteStore {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let conn = Connection::open(path)?;
@@ -78,6 +97,14 @@ impl SqliteStore {
                 is_default INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 UNIQUE(doc_type, agency, name)
+            );
+
+            CREATE TABLE IF NOT EXISTS document (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                doc_type TEXT NOT NULL,
+                title TEXT,
+                doc_json TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
             "#,
         )?;
@@ -207,6 +234,91 @@ impl SqliteStore {
             }
         }
         Ok(fields)
+    }
+
+    /// Persist a generated document and return its id.
+    pub fn save_document(
+        &self,
+        doc_type: &str,
+        title: Option<&str>,
+        doc_json: &Value,
+    ) -> Result<i64> {
+        self.conn.execute(
+            "INSERT INTO document (doc_type, title, doc_json) VALUES (?1, ?2, ?3)",
+            params![doc_type, title, serde_json::to_string(doc_json)?],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    /// List saved documents (newest first), optionally filtered by doc type.
+    pub fn list_documents(&self, doc_type: Option<&str>) -> Result<Vec<DocumentSummary>> {
+        let summary = |row: &rusqlite::Row<'_>| {
+            Ok(DocumentSummary {
+                id: row.get(0)?,
+                doc_type: row.get(1)?,
+                title: row.get(2)?,
+                created_at: row.get(3)?,
+            })
+        };
+        let mut documents = Vec::new();
+        match doc_type {
+            Some(doc_type) => {
+                let mut stmt = self.conn.prepare(
+                    "SELECT id, doc_type, title, created_at FROM document WHERE doc_type = ?1 ORDER BY id DESC",
+                )?;
+                for row in stmt.query_map(params![doc_type], summary)? {
+                    documents.push(row?);
+                }
+            }
+            None => {
+                let mut stmt = self.conn.prepare(
+                    "SELECT id, doc_type, title, created_at FROM document ORDER BY id DESC",
+                )?;
+                for row in stmt.query_map([], summary)? {
+                    documents.push(row?);
+                }
+            }
+        }
+        Ok(documents)
+    }
+
+    /// Fetch one saved document with its full content.
+    pub fn get_document(&self, id: i64) -> Result<Option<DocumentRecord>> {
+        let row: Option<(i64, String, Option<String>, String, String)> = self
+            .conn
+            .query_row(
+                "SELECT id, doc_type, title, doc_json, created_at FROM document WHERE id = ?1",
+                params![id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .optional()?;
+
+        row.map(|(id, doc_type, title, json, created_at)| {
+            Ok(DocumentRecord {
+                id,
+                doc_type,
+                title,
+                doc_json: serde_json::from_str(&json)?,
+                created_at,
+            })
+        })
+        .transpose()
+    }
+
+    /// Delete a saved document. Returns whether a row was removed.
+    pub fn delete_document(&self, id: i64) -> Result<bool> {
+        let affected = self
+            .conn
+            .execute("DELETE FROM document WHERE id = ?1", params![id])?;
+        Ok(affected > 0)
     }
 
     pub fn create_template(&self, record: NewTemplateRecord<'_>) -> Result<i64> {
@@ -482,6 +594,36 @@ mod tests {
             .unwrap();
 
         assert_eq!(template.file_path, "templates/agency.docx");
+    }
+
+    #[test]
+    fn saves_lists_gets_and_deletes_documents() {
+        let store = SqliteStore::open_memory().unwrap();
+        let id = store
+            .save_document(
+                "ภายนอก",
+                Some("ขอเชิญประชุม"),
+                &serde_json::json!({ "subject": "ขอเชิญประชุม", "body": ["..."] }),
+            )
+            .unwrap();
+        store
+            .save_document("คำสั่ง", None, &serde_json::json!({ "title": "คำสั่งที่ 1" }))
+            .unwrap();
+
+        let all = store.list_documents(None).unwrap();
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0].doc_type, "คำสั่ง"); // newest first
+
+        let external = store.list_documents(Some("ภายนอก")).unwrap();
+        assert_eq!(external.len(), 1);
+        assert_eq!(external[0].title.as_deref(), Some("ขอเชิญประชุม"));
+
+        let doc = store.get_document(id).unwrap().unwrap();
+        assert_eq!(doc.doc_json["subject"], "ขอเชิญประชุม");
+
+        assert!(store.delete_document(id).unwrap());
+        assert!(!store.delete_document(id).unwrap()); // already gone
+        assert_eq!(store.list_documents(None).unwrap().len(), 1);
     }
 
     #[test]

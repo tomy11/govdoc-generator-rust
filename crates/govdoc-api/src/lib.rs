@@ -11,7 +11,7 @@ use anyhow::Context;
 
 use axum::{
     body::Body,
-    extract::{Query, State},
+    extract::{Path, Query, State},
     http::{header, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -22,7 +22,8 @@ use govdoc_domain::{
     RenderRequest,
 };
 use govdoc_storage::{
-    NewMemoryRecord, NewTemplateRecord, PersistentVectorIndex, SqliteStore, TemplateRecord,
+    DocumentRecord, DocumentSummary, NewMemoryRecord, NewTemplateRecord, PersistentVectorIndex,
+    SqliteStore, TemplateRecord,
 };
 use govdoc_usecases::{
     edit_document_json, generate_document_json, structure_document_from_text, EmbeddingProvider,
@@ -281,6 +282,8 @@ pub fn router(state: AppState) -> Router {
         .route("/ingest/ocr", post(ingest_ocr))
         .route("/templates", get(list_templates).post(create_template))
         .route("/templates/default", get(resolve_default_template))
+        .route("/documents", get(list_documents).post(save_document))
+        .route("/documents/:id", get(get_document).delete(delete_document))
         // Permissive CORS: the API binds to localhost only and is consumed by
         // the Tauri webview / local tools, so any local origin is acceptable.
         .layer(CorsLayer::permissive())
@@ -334,6 +337,10 @@ async fn api_index() -> Json<Value> {
             { "method": "POST", "path": "/render",            "body": "RenderRequest", "desc": "Render a document to .docx via the sidecar" },
             { "method": "POST", "path": "/ingest",            "body": "IngestRequest", "desc": "Store a structured example in memory" },
             { "method": "POST", "path": "/ingest/ocr",        "body": "IngestOcrRequest", "desc": "OCR a local file into a memory example" },
+            { "method": "POST", "path": "/documents",         "body": "SaveDocumentRequest", "desc": "Save a generated document" },
+            { "method": "GET",  "path": "/documents",         "query": "doc_type", "desc": "List saved documents (newest first)" },
+            { "method": "GET",  "path": "/documents/:id",     "desc": "Get one saved document" },
+            { "method": "DELETE","path": "/documents/:id",    "desc": "Delete a saved document" },
             { "method": "GET",  "path": "/templates",         "query": "doc_type, agency", "desc": "List templates" },
             { "method": "POST", "path": "/templates",         "body": "TemplateCreateRequest", "desc": "Create a template" },
             { "method": "GET",  "path": "/templates/default", "query": "doc_type, agency", "desc": "Resolve the default template" }
@@ -723,6 +730,100 @@ async fn resolve_default_template(
     Ok(Json(template.into()))
 }
 
+#[derive(Debug, Deserialize)]
+struct SaveDocumentRequest {
+    doc_type: DocType,
+    /// The generated document JSON (as returned by `/generate`).
+    doc_data: Value,
+    title: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DocumentQuery {
+    doc_type: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct SavedResponse {
+    id: i64,
+}
+
+#[derive(Debug, Serialize)]
+struct DocumentSummaryResponse {
+    id: i64,
+    doc_type: String,
+    title: Option<String>,
+    created_at: String,
+}
+
+#[derive(Debug, Serialize)]
+struct DocumentResponse {
+    id: i64,
+    doc_type: String,
+    title: Option<String>,
+    doc_data: Value,
+    created_at: String,
+}
+
+async fn save_document(
+    State(state): State<AppState>,
+    Json(req): Json<SaveDocumentRequest>,
+) -> Result<Json<SavedResponse>, ApiError> {
+    let store = lock_store(&state)?;
+    let id = store
+        .save_document(req.doc_type.as_thai(), req.title.as_deref(), &req.doc_data)
+        .map_err(internal_error)?;
+    Ok(Json(SavedResponse { id }))
+}
+
+async fn list_documents(
+    State(state): State<AppState>,
+    Query(query): Query<DocumentQuery>,
+) -> Result<Json<Vec<DocumentSummaryResponse>>, ApiError> {
+    let store = lock_store(&state)?;
+    let documents = store
+        .list_documents(query.doc_type.as_deref())
+        .map_err(internal_error)?;
+    Ok(Json(documents.into_iter().map(Into::into).collect()))
+}
+
+async fn get_document(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<Json<DocumentResponse>, ApiError> {
+    let store = lock_store(&state)?;
+    let document = store
+        .get_document(id)
+        .map_err(internal_error)?
+        .ok_or_else(|| ApiError {
+            status: StatusCode::NOT_FOUND,
+            detail: format!("Document {id} not found"),
+        })?;
+    Ok(Json(document.into()))
+}
+
+async fn delete_document(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<StatusCode, ApiError> {
+    let store = lock_store(&state)?;
+    if store.delete_document(id).map_err(internal_error)? {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err(ApiError {
+            status: StatusCode::NOT_FOUND,
+            detail: format!("Document {id} not found"),
+        })
+    }
+}
+
+fn lock_store(state: &AppState) -> Result<std::sync::MutexGuard<'_, SqliteStore>, ApiError> {
+    state.template_store.lock().map_err(|_| ApiError {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        detail: "store lock poisoned".to_string(),
+    })
+}
+
 struct ApiError {
     status: StatusCode,
     detail: String,
@@ -749,6 +850,29 @@ impl From<TemplateRecord> for TemplateResponse {
             name: template.name,
             file_path: template.file_path,
             is_default: template.is_default,
+        }
+    }
+}
+
+impl From<DocumentSummary> for DocumentSummaryResponse {
+    fn from(doc: DocumentSummary) -> Self {
+        Self {
+            id: doc.id,
+            doc_type: doc.doc_type,
+            title: doc.title,
+            created_at: doc.created_at,
+        }
+    }
+}
+
+impl From<DocumentRecord> for DocumentResponse {
+    fn from(doc: DocumentRecord) -> Self {
+        Self {
+            id: doc.id,
+            doc_type: doc.doc_type,
+            title: doc.title,
+            doc_data: doc.doc_json,
+            created_at: doc.created_at,
         }
     }
 }
@@ -1113,6 +1237,91 @@ mod tests {
 
         assert_eq!(json["trace"][0]["step"], "retrieval");
         assert_eq!(json["trace"][0]["detail"]["examples"], 1);
+    }
+
+    #[tokio::test]
+    async fn documents_save_list_get_delete() {
+        let app = router(AppState::default());
+
+        // save
+        let save = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/documents")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"doc_type":"ภายนอก","title":"ขอเชิญประชุม","doc_data":{"subject":"ขอเชิญประชุม"}}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(save.status(), StatusCode::OK);
+        let body = to_bytes(save.into_body(), usize::MAX).await.unwrap();
+        let id = serde_json::from_slice::<Value>(&body).unwrap()["id"]
+            .as_i64()
+            .unwrap();
+
+        // list
+        let list = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/documents")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = to_bytes(list.into_body(), usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json[0]["title"], "ขอเชิญประชุม");
+
+        // get
+        let get = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(format!("/documents/{id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = to_bytes(get.into_body(), usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["doc_data"]["subject"], "ขอเชิญประชุม");
+
+        // delete
+        let del = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/documents/{id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(del.status(), StatusCode::NO_CONTENT);
+
+        // gone
+        let missing = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(format!("/documents/{id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]

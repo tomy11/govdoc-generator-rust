@@ -74,11 +74,13 @@ document.getElementById("gen-form").addEventListener("submit", async (e) => {
   const traceWrap = document.getElementById("trace-wrap");
   const renderBtn = document.getElementById("render-btn");
 
+  const saveBtn = document.getElementById("save-btn");
   btn.disabled = true;
   btn.textContent = "กำลังสร้าง…";
   result.className = "result muted";
   result.textContent = "กำลังเรียกโมเดล…";
   renderBtn.disabled = true;
+  saveBtn.disabled = true;
 
   try {
     const req = formToRequest(form);
@@ -95,8 +97,9 @@ document.getElementById("gen-form").addEventListener("submit", async (e) => {
     document.getElementById("trace").textContent = JSON.stringify(data.trace, null, 2);
     traceWrap.hidden = false;
 
-    lastDoc = { doc_type: req.doc_type, doc_data: data.doc };
+    lastDoc = { doc_type: req.doc_type, doc_data: data.doc, title: req.subject || "" };
     renderBtn.disabled = false;
+    saveBtn.disabled = false;
   } catch (err) {
     result.className = "result error";
     result.textContent = `❌ ${err.message}`;
@@ -134,5 +137,84 @@ document.getElementById("render-btn").addEventListener("click", async () => {
   }
 });
 
+// ---- saved documents -------------------------------------------------------
+
+document.getElementById("save-btn").addEventListener("click", async () => {
+  if (!lastDoc) return;
+  const btn = document.getElementById("save-btn");
+  btn.disabled = true;
+  try {
+    const res = await fetch(`${API}/documents`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(lastDoc),
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.detail || `บันทึกล้มเหลว (${res.status})`);
+    }
+    btn.textContent = "บันทึกแล้ว ✓";
+    setTimeout(() => (btn.textContent = "บันทึกเก็บไว้"), 1500);
+    loadDocuments();
+  } catch (err) {
+    alert(err.message);
+  } finally {
+    btn.disabled = false;
+  }
+});
+
+async function openDocument(id) {
+  try {
+    const doc = await (await fetch(`${API}/documents/${id}`)).json();
+    const result = document.getElementById("result");
+    result.className = "result";
+    result.replaceChildren(renderDoc(doc.doc_data));
+    lastDoc = { doc_type: doc.doc_type, doc_data: doc.doc_data, title: doc.title || "" };
+    document.getElementById("render-btn").disabled = false;
+    document.getElementById("save-btn").disabled = false;
+    window.scrollTo({ top: 0, behavior: "smooth" });
+  } catch {
+    alert("เปิดเอกสารไม่ได้");
+  }
+}
+
+async function deleteDocument(id) {
+  if (!confirm("ลบเอกสารนี้?")) return;
+  await fetch(`${API}/documents/${id}`, { method: "DELETE" });
+  loadDocuments();
+}
+
+async function loadDocuments() {
+  const list = document.getElementById("doc-list");
+  try {
+    const docs = await (await fetch(`${API}/documents`)).json();
+    if (!docs.length) {
+      list.innerHTML = '<li class="muted">ยังไม่มีเอกสารที่บันทึก</li>';
+      return;
+    }
+    list.replaceChildren(
+      ...docs.map((d) => {
+        const li = document.createElement("li");
+        const open = document.createElement("button");
+        open.className = "open";
+        const when = (d.created_at || "").replace("T", " ").slice(0, 16);
+        open.innerHTML = `${d.title || "(ไม่มีชื่อเรื่อง)"} <span class="meta">· ${d.doc_type} · ${when}</span>`;
+        open.addEventListener("click", () => openDocument(d.id));
+        const del = document.createElement("button");
+        del.className = "del";
+        del.textContent = "ลบ";
+        del.addEventListener("click", () => deleteDocument(d.id));
+        li.append(open, del);
+        return li;
+      }),
+    );
+  } catch {
+    list.innerHTML = '<li class="muted">โหลดรายการไม่ได้</li>';
+  }
+}
+
+document.getElementById("refresh-docs").addEventListener("click", loadDocuments);
+
 loadStatus();
+loadDocuments();
 setInterval(loadStatus, 10000);
