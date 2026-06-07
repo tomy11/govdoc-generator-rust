@@ -251,6 +251,124 @@ impl EmbeddingProvider for TyphoonEmbeddingProvider {
     }
 }
 
+/// Connection settings for the Typhoon OCR endpoint.
+#[derive(Clone, Debug)]
+pub struct OcrConfig {
+    /// Base URL including the version prefix.
+    pub base_url: String,
+    /// OCR model id (e.g. `typhoon-ocr`).
+    pub model: String,
+    /// Bearer token. Required: OCR is cloud-only.
+    pub api_key: Option<String>,
+}
+
+impl OcrConfig {
+    /// Build config from `OCR_*` env vars, reusing `LLM_API_KEY` as the key.
+    pub fn from_env() -> Self {
+        Self {
+            base_url: std::env::var("OCR_BASE_URL")
+                .unwrap_or_else(|_| "https://api.opentyphoon.ai/v1".to_string()),
+            model: std::env::var("OCR_MODEL").unwrap_or_else(|_| "typhoon-ocr".to_string()),
+            api_key: std::env::var("LLM_API_KEY").ok().filter(|k| !k.is_empty()),
+        }
+    }
+}
+
+/// Document OCR backed by the Typhoon `/v1/ocr` endpoint.
+pub struct TyphoonOcrProvider {
+    client: reqwest::Client,
+    config: OcrConfig,
+}
+
+impl TyphoonOcrProvider {
+    pub fn new(config: OcrConfig) -> anyhow::Result<Self> {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(300))
+            .build()
+            .context("failed to build HTTP client for OCR provider")?;
+        Ok(Self { client, config })
+    }
+
+    /// Extract text/markdown from an image or PDF. Returns the natural text of
+    /// every successfully processed page, joined by blank lines.
+    pub async fn extract_text(&self, file: &[u8], filename: &str) -> anyhow::Result<String> {
+        let key = self
+            .config
+            .api_key
+            .as_deref()
+            .ok_or_else(|| anyhow!("OCR requires LLM_API_KEY"))?;
+        let url = format!("{}/ocr", self.config.base_url.trim_end_matches('/'));
+
+        let part = reqwest::multipart::Part::bytes(file.to_vec()).file_name(filename.to_string());
+        let form = reqwest::multipart::Form::new()
+            .part("file", part)
+            .text("model", self.config.model.clone())
+            .text("task_type", "default")
+            .text("max_tokens", "16384")
+            .text("temperature", "0.1")
+            .text("top_p", "0.6")
+            .text("repetition_penalty", "1.2");
+
+        let response = self
+            .client
+            .post(&url)
+            .bearer_auth(key)
+            .multipart(form)
+            .send()
+            .await
+            .with_context(|| format!("request to {url} failed"))?;
+        let status = response.status();
+        let payload = response
+            .text()
+            .await
+            .context("failed to read OCR response body")?;
+        if !status.is_success() {
+            return Err(anyhow!("OCR server returned {status}: {payload}"));
+        }
+
+        let parsed: Value =
+            serde_json::from_str(&payload).context("OCR response was not valid JSON")?;
+        parse_ocr_response(&parsed)
+    }
+}
+
+/// Pull the natural text out of a Typhoon OCR response, concatenating pages.
+///
+/// Each page's `message.choices[0].message.content` is either plain text or a
+/// JSON string carrying a `natural_text` field; both are handled.
+fn parse_ocr_response(payload: &Value) -> anyhow::Result<String> {
+    let results = payload["results"]
+        .as_array()
+        .ok_or_else(|| anyhow!("OCR response missing results array: {payload}"))?;
+
+    let mut texts = Vec::new();
+    for page in results {
+        if page["success"].as_bool() != Some(true) {
+            let detail = page["error"].as_str().unwrap_or("unknown error");
+            let name = page["filename"].as_str().unwrap_or("page");
+            return Err(anyhow!("OCR failed for {name}: {detail}"));
+        }
+        let Some(content) = page["message"]["choices"][0]["message"]["content"].as_str() else {
+            continue;
+        };
+        texts.push(natural_text(content));
+    }
+
+    if texts.is_empty() {
+        return Err(anyhow!("OCR returned no text"));
+    }
+    Ok(texts.join("\n\n"))
+}
+
+/// Structured OCR output is a JSON string with a `natural_text` field; plain
+/// output is used as-is.
+fn natural_text(content: &str) -> String {
+    serde_json::from_str::<Value>(content)
+        .ok()
+        .and_then(|value| value["natural_text"].as_str().map(str::to_owned))
+        .unwrap_or_else(|| content.to_string())
+}
+
 /// Pull a JSON value out of a model response that may be wrapped in prose or a
 /// ```json fenced block.
 fn extract_json(text: &str) -> anyhow::Result<Value> {
@@ -331,5 +449,38 @@ mod tests {
     #[test]
     fn extract_json_errors_without_object() {
         assert!(extract_json("ไม่มี JSON เลย").is_err());
+    }
+
+    #[test]
+    fn ocr_parses_natural_text_and_plain_pages() {
+        let payload = serde_json::json!({
+            "results": [
+                {
+                    "success": true,
+                    "message": {
+                        "choices": [
+                            { "message": { "content": "{\"natural_text\": \"หน้า 1\"}" } }
+                        ]
+                    }
+                },
+                {
+                    "success": true,
+                    "message": { "choices": [ { "message": { "content": "หน้า 2" } } ] }
+                }
+            ]
+        });
+        assert_eq!(parse_ocr_response(&payload).unwrap(), "หน้า 1\n\nหน้า 2");
+    }
+
+    #[test]
+    fn ocr_surfaces_page_errors() {
+        let payload = serde_json::json!({
+            "results": [
+                { "success": false, "filename": "scan.pdf", "error": "bad page" }
+            ]
+        });
+        let err = parse_ocr_response(&payload).unwrap_err().to_string();
+        assert!(err.contains("scan.pdf"));
+        assert!(err.contains("bad page"));
     }
 }

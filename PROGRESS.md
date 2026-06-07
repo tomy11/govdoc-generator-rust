@@ -1,5 +1,56 @@
 # Progress Log
 
+## 2026-06-07 (later) — Persistence, dotenv, docs index
+
+### Work Completed
+
+- Wired `SQLITE_PATH`: `AppState` now opens a file-backed store (creating parent
+  dirs) when the env var is set, falling back to in-memory otherwise. Ingested
+  examples and templates survive a restart. Verified live: ingest -> kill ->
+  restart -> `/generate` retrieval still reports `examples: 1`. Added a storage
+  reopen-persistence unit test and a defensive `ALTER TABLE ... ADD COLUMN
+  embedding` for pre-existing databases.
+- Load `.env` at startup via `dotenvy` so secrets (e.g. `LLM_API_KEY`) live in
+  the gitignored `.env` instead of the command line. Shell env still overrides.
+- Added a lightweight endpoint index at `GET /` and `GET /docs` (the Axum port
+  has no Swagger UI like the FastAPI original).
+
+### Validation
+
+`cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D
+warnings`, and `cargo test --workspace` (32 tests, 0 failures) all pass.
+
+## 2026-06-07 (later) — Ingestion pipeline
+
+### Work Completed
+
+- Added `TyphoonOcrProvider` (`crates/govdoc-api/src/providers.rs`) calling the
+  Typhoon `/v1/ocr` multipart endpoint, with a pure `parse_ocr_response` that
+  joins page `natural_text` (or plain content) and surfaces page errors. Unit
+  tested. Enabled the `multipart` feature on reqwest.
+- Added ingestion endpoints to the API:
+  - `POST /ingest` — store a structured example document directly.
+  - `POST /ingest/ocr` — OCR a local file into an example via Typhoon OCR.
+  Both embed the summary (when `EMBEDDING_BACKEND=remote`) and write to
+  `gov_doc_memory`. `AppState::embed_for_storage` returns `None` on the fake
+  backend so retrieval falls back to recency instead of indexing zero vectors.
+- Closed the loop: integration test ingests an example and confirms `/generate`
+  retrieval reports `examples: 1`.
+- Made `DocType` `Copy` (fieldless enum) to pass it by value cleanly.
+- Docs: README ingestion section + endpoints; `.env.example` `OCR_*` keys.
+
+### Validation
+
+`cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D
+warnings`, and `cargo test --workspace` (30 tests, 0 failures) all pass.
+
+### Follow-ups
+
+- OCR'd text is stored as a raw example (`fields.content`). An optional LLM pass
+  to structure it into the per-doc-type schema would make examples stronger.
+- `/ingest/ocr` reads a local path (desktop-first); a multipart upload variant
+  can be added if needed for remote callers.
+
 ## 2026-06-07
 
 ### Work Completed

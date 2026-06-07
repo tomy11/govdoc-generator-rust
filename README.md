@@ -40,14 +40,23 @@ The API listens on `127.0.0.1:8000` by default. Override it with:
 GOVDOC_API_ADDR=127.0.0.1:9000 cargo run -p govdoc-api
 ```
 
+Configuration is read from the environment; a `.env` file in the working
+directory is loaded automatically (shell env wins over `.env`). Copy
+`.env.example` to `.env` and fill in secrets like `LLM_API_KEY` there rather
+than passing them on the command line. Set `SQLITE_PATH` to persist templates
+and ingested examples across restarts; without it the store is in-memory only.
+
 ## API Surface
 
 The local API currently exposes:
 
+- `GET /` or `GET /docs` (JSON endpoint index; no Swagger UI)
 - `GET /health`
 - `POST /generate`
 - `POST /edit`
 - `POST /render`
+- `POST /ingest`
+- `POST /ingest/ocr`
 - `GET /templates`
 - `POST /templates`
 - `GET /templates/default`
@@ -82,9 +91,36 @@ backend is chosen by `EMBEDDING_BACKEND`:
 
 Examples are stored in SQLite (`gov_doc_memory`) with their embeddings;
 `SqliteMemoryRepository` builds an in-memory cosine index per request and
-returns the nearest examples. The store starts empty, so retrieval returns
-nothing until examples are ingested — that ingestion path (e.g. via OCR) is the
-next piece of work.
+returns the nearest examples. The store starts empty — populate it via the
+ingestion endpoints below.
+
+## Ingestion
+
+Add examples that `/generate` can retrieve:
+
+- `POST /ingest` — store a structured example directly:
+
+  ```json
+  {
+    "doc_type": "ภายนอก",
+    "fields": { "doc_type": "ภายนอก", "subject": "...", "body": ["..."] },
+    "summary": "optional; derived from fields when omitted",
+    "agency": "optional",
+    "recipient_class": "optional"
+  }
+  ```
+
+- `POST /ingest/ocr` — OCR a local image/PDF into an example via Typhoon OCR
+  (cloud-only, uses `LLM_API_KEY`):
+
+  ```json
+  { "file_path": "/path/to/scan.pdf", "doc_type": "ภายนอก" }
+  ```
+
+Each ingest embeds the summary (when `EMBEDDING_BACKEND=remote`) and stores it
+with the document. With the fake embedding backend the example is still stored
+and surfaced through recency-based retrieval (`embedded: false` in the
+response).
 
 > Note: a hosted Typhoon embeddings endpoint was not confirmed available at the
 > time of writing; the provider targets the OpenAI-compatible contract so it

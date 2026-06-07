@@ -81,6 +81,11 @@ impl SqliteStore {
             );
             "#,
         )?;
+        // Backfill the embedding column for databases created before it existed.
+        // Errors with "duplicate column" when already present, which we ignore.
+        let _ = self
+            .conn
+            .execute("ALTER TABLE gov_doc_memory ADD COLUMN embedding TEXT", []);
         Ok(())
     }
 
@@ -396,6 +401,36 @@ mod tests {
 
         let recent = store.recent_memory_fields(Some("ภายนอก"), 5).unwrap();
         assert_eq!(recent.len(), 2);
+    }
+
+    #[test]
+    fn persists_memory_across_reopen() {
+        let path = std::env::temp_dir().join("govdoc-persist-test-9f3a2.sqlite3");
+        let _ = std::fs::remove_file(&path);
+
+        {
+            let store = SqliteStore::open(&path).unwrap();
+            store
+                .store_memory(NewMemoryRecord {
+                    doc_type: "ภายนอก",
+                    summary_text: "persisted",
+                    fields: &serde_json::json!({ "subject": "ถาวร" }),
+                    recipient_class: None,
+                    agency: None,
+                    template_id: None,
+                    raw_text: None,
+                    embedding: Some(&[0.5, 0.5]),
+                })
+                .unwrap();
+        }
+
+        let store = SqliteStore::open(&path).unwrap();
+        let recent = store.recent_memory_fields(Some("ภายนอก"), 5).unwrap();
+        assert_eq!(recent.len(), 1);
+        assert_eq!(recent[0]["subject"], "ถาวร");
+        assert_eq!(store.memory_embeddings(Some("ภายนอก")).unwrap().len(), 1);
+
+        std::fs::remove_file(&path).ok();
     }
 
     #[test]
