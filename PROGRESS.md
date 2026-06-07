@@ -1,5 +1,29 @@
 # Progress Log
 
+## 2026-06-07 (later) — File uploads (reference example + .docx template)
+
+### Work Completed
+
+- Two multipart upload endpoints so the desktop UI can upload a file directly
+  (not just a server-side path):
+  - `POST /ingest/ocr/upload` — upload an image/PDF, OCR + structure it, store as
+    a memory example. Refactored the OCR-ingest pipeline into a shared
+    `run_ocr_ingest` used by both the path and upload variants.
+  - `POST /templates/upload` — upload a `.docx` render template, save it under
+    `GOVDOC_TEMPLATES_DIR` (with a timestamped, sanitized filename), and register
+    it in `doc_template`.
+- Enabled axum's `multipart` feature; a shared `Upload` helper parses fields +
+  file; 25 MB body limit for uploads; `sanitize_filename` unit tested.
+- UI: an "อัปโหลดต้นแบบ" panel with two forms (reference example via OCR, and
+  `.docx` template).
+- Verified live: `.docx` template upload saves the file + registers + lists;
+  graceful errors (500 without an OCR key, 400 when the file is missing).
+
+### Validation
+
+`cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D
+warnings`, and `cargo test --workspace` (39 tests, 0 failures) all pass.
+
 ## 2026-06-07 (later) — Document persistence
 
 ### Work Completed

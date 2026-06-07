@@ -95,6 +95,49 @@
         </div>
         <ul id="doc-list" class="doc-list"><li class="muted">กำลังโหลด…</li></ul>
       </section>
+
+      <section class="card wide">
+        <h2>อัปโหลดต้นแบบ</h2>
+        <div class="upload-grid">
+          <form id="example-form" class="upload-box">
+            <h3>ตัวอย่างให้ AI เลียนแบบ</h3>
+            <p class="muted small">อัปโหลดหนังสือจริง (รูป/PDF) → OCR → เก็บเป็นตัวอย่างใน memory (ต้องตั้งค่า OCR key)</p>
+            <input type="file" name="file" accept="image/*,.pdf" required />
+            <label>ประเภท
+              <select name="doc_type">
+                <option value="ภายนอก">หนังสือภายนอก</option>
+                <option value="ภายใน">หนังสือภายใน</option>
+                <option value="คำสั่ง">คำสั่ง</option>
+                <option value="ประกาศ">ประกาศ</option>
+              </select>
+            </label>
+            <button type="submit">อัปโหลดเป็นตัวอย่าง</button>
+            <div class="upload-msg muted small"></div>
+          </form>
+
+          <form id="template-form" class="upload-box">
+            <h3>แม่แบบ .docx (สำหรับ export)</h3>
+            <p class="muted small">ไฟล์ .docx มี placeholder/หัวกระดาษ → ใช้ตอน render เป็น .docx</p>
+            <input type="file" name="file" accept=".docx" required />
+            <div class="row">
+              <label>ประเภท
+                <select name="doc_type">
+                  <option value="ภายนอก">หนังสือภายนอก</option>
+                  <option value="ภายใน">หนังสือภายใน</option>
+                  <option value="คำสั่ง">คำสั่ง</option>
+                  <option value="ประกาศ">ประกาศ</option>
+                </select>
+              </label>
+              <label>ชื่อแม่แบบ
+                <input name="name" placeholder="เช่น แม่แบบกลาง" required />
+              </label>
+            </div>
+            <label class="checkbox"><input type="checkbox" name="is_default" /> ตั้งเป็นค่าเริ่มต้น</label>
+            <button type="submit">อัปโหลดแม่แบบ</button>
+            <div class="upload-msg muted small"></div>
+          </form>
+        </div>
+      </section>
     </main>
 
     <script src="app.js"></script>

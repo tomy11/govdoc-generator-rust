@@ -11,7 +11,7 @@ use anyhow::Context;
 
 use axum::{
     body::Body,
-    extract::{Path, Query, State},
+    extract::{DefaultBodyLimit, Multipart, Path, Query, State},
     http::{header, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -280,10 +280,14 @@ pub fn router(state: AppState) -> Router {
         .route("/render", post(render))
         .route("/ingest", post(ingest))
         .route("/ingest/ocr", post(ingest_ocr))
+        .route("/ingest/ocr/upload", post(ingest_ocr_upload))
         .route("/templates", get(list_templates).post(create_template))
+        .route("/templates/upload", post(upload_template))
         .route("/templates/default", get(resolve_default_template))
         .route("/documents", get(list_documents).post(save_document))
         .route("/documents/:id", get(get_document).delete(delete_document))
+        // Allow up to 25 MB uploads (scanned PDFs, .docx templates).
+        .layer(DefaultBodyLimit::max(25 * 1024 * 1024))
         // Permissive CORS: the API binds to localhost only and is consumed by
         // the Tauri webview / local tools, so any local origin is acceptable.
         .layer(CorsLayer::permissive())
@@ -337,12 +341,14 @@ async fn api_index() -> Json<Value> {
             { "method": "POST", "path": "/render",            "body": "RenderRequest", "desc": "Render a document to .docx via the sidecar" },
             { "method": "POST", "path": "/ingest",            "body": "IngestRequest", "desc": "Store a structured example in memory" },
             { "method": "POST", "path": "/ingest/ocr",        "body": "IngestOcrRequest", "desc": "OCR a local file into a memory example" },
+            { "method": "POST", "path": "/ingest/ocr/upload", "body": "multipart (file, doc_type)", "desc": "Upload + OCR a scan into a memory example" },
             { "method": "POST", "path": "/documents",         "body": "SaveDocumentRequest", "desc": "Save a generated document" },
             { "method": "GET",  "path": "/documents",         "query": "doc_type", "desc": "List saved documents (newest first)" },
             { "method": "GET",  "path": "/documents/:id",     "desc": "Get one saved document" },
             { "method": "DELETE","path": "/documents/:id",    "desc": "Delete a saved document" },
             { "method": "GET",  "path": "/templates",         "query": "doc_type, agency", "desc": "List templates" },
-            { "method": "POST", "path": "/templates",         "body": "TemplateCreateRequest", "desc": "Create a template" },
+            { "method": "POST", "path": "/templates",         "body": "TemplateCreateRequest", "desc": "Register a template by file path" },
+            { "method": "POST", "path": "/templates/upload",  "body": "multipart (file, doc_type, name)", "desc": "Upload a .docx render template" },
             { "method": "GET",  "path": "/templates/default", "query": "doc_type, agency", "desc": "Resolve the default template" }
         ]
     }))
@@ -484,7 +490,6 @@ async fn ingest_ocr(
     State(state): State<AppState>,
     Json(req): Json<IngestOcrRequest>,
 ) -> Result<Json<IngestResponse>, ApiError> {
-    let ocr = state.build_ocr()?;
     let bytes = std::fs::read(&req.file_path).map_err(|err| ApiError {
         status: StatusCode::BAD_REQUEST,
         detail: format!("cannot read {}: {err}", req.file_path),
@@ -495,8 +500,61 @@ async fn ingest_ocr(
         .unwrap_or("document")
         .to_string();
 
+    let resp = run_ocr_ingest(
+        &state,
+        req.doc_type,
+        &filename,
+        &bytes,
+        req.agency.as_deref(),
+        req.recipient_class.as_deref(),
+        req.structure,
+    )
+    .await?;
+    Ok(Json(resp))
+}
+
+/// Upload a scanned document (image/PDF) and ingest it as a memory example via
+/// OCR. Multipart fields: `file`, `doc_type`, optional `agency`,
+/// `recipient_class`, `structure` (default true).
+async fn ingest_ocr_upload(
+    State(state): State<AppState>,
+    multipart: Multipart,
+) -> Result<Json<IngestResponse>, ApiError> {
+    let upload = Upload::collect(multipart).await?;
+    let doc_type = upload.doc_type()?;
+    let (filename, bytes) = upload.file()?;
+    let structure = upload
+        .field("structure")
+        .map(|v| v != "false")
+        .unwrap_or(true);
+
+    let resp = run_ocr_ingest(
+        &state,
+        doc_type,
+        filename,
+        bytes,
+        upload.field("agency"),
+        upload.field("recipient_class"),
+        structure,
+    )
+    .await?;
+    Ok(Json(resp))
+}
+
+/// Shared OCR-ingest pipeline used by both the path and upload variants: OCR the
+/// bytes, optionally structure into the schema, embed, and store.
+async fn run_ocr_ingest(
+    state: &AppState,
+    doc_type: DocType,
+    filename: &str,
+    bytes: &[u8],
+    agency: Option<&str>,
+    recipient_class: Option<&str>,
+    structure: bool,
+) -> Result<IngestResponse, ApiError> {
+    let ocr = state.build_ocr()?;
     let text = ocr
-        .extract_text(&bytes, &filename)
+        .extract_text(bytes, filename)
         .await
         .map_err(|err| ApiError {
             status: StatusCode::BAD_GATEWAY,
@@ -506,21 +564,21 @@ async fn ingest_ocr(
     // Best-effort: structure the OCR text into the document schema. On any
     // failure, fall back to storing the raw text as a content example.
     let mut structured_fields = None;
-    if req.structure {
+    if structure {
         let llm = state.build_llm()?;
-        if let Ok(fields) = structure_document_from_text(&req.doc_type, &text, llm.as_ref()).await {
+        if let Ok(fields) = structure_document_from_text(&doc_type, &text, llm.as_ref()).await {
             structured_fields = Some(fields);
         }
     }
 
     let (fields, summary, structured) = match structured_fields {
         Some(fields) => {
-            let summary = derive_summary(req.doc_type, &fields);
+            let summary = derive_summary(doc_type, &fields);
             (fields, summary, true)
         }
         None => {
             let fields = serde_json::json!({
-                "doc_type": req.doc_type.as_thai(),
+                "doc_type": doc_type.as_thai(),
                 "content": text,
                 "source": filename,
             });
@@ -530,20 +588,152 @@ async fn ingest_ocr(
 
     let embedding = state.embed_for_storage(&summary).await?;
     let id = store_memory_record(
-        &state,
-        req.doc_type,
+        state,
+        doc_type,
         &summary,
         &fields,
-        req.agency.as_deref(),
-        req.recipient_class.as_deref(),
+        agency,
+        recipient_class,
         Some(text.as_str()),
         embedding.as_deref(),
     )?;
-    Ok(Json(IngestResponse {
+    Ok(IngestResponse {
         id,
         embedded: embedding.is_some(),
         structured,
-    }))
+    })
+}
+
+/// Upload a `.docx` render template, save it under `GOVDOC_TEMPLATES_DIR`, and
+/// register it. Multipart fields: `file`, `doc_type`, `name`, optional `agency`,
+/// `is_default`.
+async fn upload_template(
+    State(state): State<AppState>,
+    multipart: Multipart,
+) -> Result<Json<TemplateResponse>, ApiError> {
+    let upload = Upload::collect(multipart).await?;
+    let doc_type = upload.required("doc_type")?.to_string();
+    let name = upload.required("name")?.to_string();
+    let (orig_name, bytes) = upload.file()?;
+    let is_default = matches!(upload.field("is_default"), Some("true" | "on" | "1"));
+
+    let dir =
+        std::env::var("GOVDOC_TEMPLATES_DIR").unwrap_or_else(|_| "app-data/templates".to_string());
+    std::fs::create_dir_all(&dir).map_err(io_error)?;
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let path = format!("{dir}/{millis}_{}", sanitize_filename(orig_name));
+    std::fs::write(&path, bytes).map_err(io_error)?;
+
+    let store = lock_store(&state)?;
+    let id = store
+        .create_template(NewTemplateRecord {
+            doc_type: &doc_type,
+            name: &name,
+            file_path: &path,
+            agency: upload.field("agency"),
+            is_default,
+        })
+        .map_err(internal_error)?;
+    let template = store
+        .get_template(id)
+        .map_err(internal_error)?
+        .ok_or_else(|| ApiError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            detail: "created template could not be read back".to_string(),
+        })?;
+    Ok(Json(template.into()))
+}
+
+/// A collected multipart form: text fields keyed by name plus one optional file.
+struct Upload {
+    fields: std::collections::HashMap<String, String>,
+    filename: Option<String>,
+    bytes: Option<Vec<u8>>,
+}
+
+impl Upload {
+    async fn collect(mut multipart: Multipart) -> Result<Self, ApiError> {
+        let mut fields = std::collections::HashMap::new();
+        let mut filename = None;
+        let mut bytes = None;
+        while let Some(field) = multipart.next_field().await.map_err(bad_multipart)? {
+            let name = field.name().unwrap_or("").to_string();
+            if name == "file" {
+                filename = field.file_name().map(ToOwned::to_owned);
+                bytes = Some(field.bytes().await.map_err(bad_multipart)?.to_vec());
+            } else {
+                fields.insert(name, field.text().await.map_err(bad_multipart)?);
+            }
+        }
+        Ok(Self {
+            fields,
+            filename,
+            bytes,
+        })
+    }
+
+    fn field(&self, name: &str) -> Option<&str> {
+        self.fields
+            .get(name)
+            .map(String::as_str)
+            .filter(|value| !value.is_empty())
+    }
+
+    fn required(&self, name: &str) -> Result<&str, ApiError> {
+        self.field(name).ok_or_else(|| ApiError {
+            status: StatusCode::BAD_REQUEST,
+            detail: format!("missing form field: {name}"),
+        })
+    }
+
+    fn doc_type(&self) -> Result<DocType, ApiError> {
+        let raw = self.required("doc_type")?;
+        serde_json::from_value::<DocType>(Value::String(raw.to_string())).map_err(|_| ApiError {
+            status: StatusCode::BAD_REQUEST,
+            detail: format!("invalid doc_type: {raw}"),
+        })
+    }
+
+    fn file(&self) -> Result<(&str, &[u8]), ApiError> {
+        let bytes = self.bytes.as_deref().ok_or_else(|| ApiError {
+            status: StatusCode::BAD_REQUEST,
+            detail: "missing file field".to_string(),
+        })?;
+        Ok((self.filename.as_deref().unwrap_or("upload"), bytes))
+    }
+}
+
+fn bad_multipart(err: axum::extract::multipart::MultipartError) -> ApiError {
+    ApiError {
+        status: StatusCode::BAD_REQUEST,
+        detail: format!("invalid multipart form: {err}"),
+    }
+}
+
+fn io_error(err: std::io::Error) -> ApiError {
+    ApiError {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        detail: err.to_string(),
+    }
+}
+
+/// Keep just the base name and drop control/path characters from an uploaded
+/// file name before writing it to disk.
+fn sanitize_filename(name: &str) -> String {
+    let base = name.rsplit(['/', '\\']).next().unwrap_or(name);
+    let cleaned: String = base
+        .chars()
+        .map(|c| if c.is_whitespace() { '_' } else { c })
+        .filter(|c| !c.is_control())
+        .collect();
+    if cleaned.is_empty() {
+        "template.docx".to_string()
+    } else {
+        cleaned
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1015,6 +1205,16 @@ mod tests {
     #[tokio::test]
     async fn builds_router() {
         let _router = router(AppState::default());
+    }
+
+    #[test]
+    fn sanitize_filename_keeps_base_name_only() {
+        assert_eq!(
+            sanitize_filename("/etc/../หนังสือ ภายนอก.docx"),
+            "หนังสือ_ภายนอก.docx"
+        );
+        assert_eq!(sanitize_filename("a\\b\\c.docx"), "c.docx");
+        assert_eq!(sanitize_filename(""), "template.docx");
     }
 
     #[tokio::test]

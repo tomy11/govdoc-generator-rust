@@ -79,10 +79,10 @@ The local API currently exposes:
 - `POST /edit`
 - `POST /render`
 - `POST /ingest`
-- `POST /ingest/ocr`
+- `POST /ingest/ocr` · `POST /ingest/ocr/upload` (multipart)
 - `POST /documents` · `GET /documents` · `GET /documents/:id` · `DELETE /documents/:id`
 - `GET /templates`
-- `POST /templates`
+- `POST /templates` · `POST /templates/upload` (multipart .docx)
 - `GET /templates/default`
 
 CORS is permissive (the API binds to localhost and is meant to run as a Tauri
@@ -157,6 +157,16 @@ Each ingest embeds the summary (when `EMBEDDING_BACKEND=remote`) and stores it
 with the document. With the fake embedding backend the example is still stored
 and surfaced through recency-based retrieval (`embedded: false` in the
 response).
+
+For browser uploads (the desktop UI), two multipart endpoints take the file
+directly instead of a path:
+
+- `POST /ingest/ocr/upload` — upload an image/PDF to OCR into a memory example.
+- `POST /templates/upload` — upload a `.docx` render template (saved under
+  `GOVDOC_TEMPLATES_DIR` and registered). Fields: `file`, `doc_type`, `name`,
+  optional `agency`, `is_default`.
+
+The UI's "อัปโหลดต้นแบบ" panel uses both.
 
 > Note: Typhoon does not expose a `/v1/embeddings` endpoint, so point `remote`
 > at the local sidecar below or another OpenAI-compatible provider (e.g. OpenAI
