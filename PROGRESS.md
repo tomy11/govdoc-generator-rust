@@ -1,5 +1,36 @@
 # Progress Log
 
+## 2026-06-07 (later) — Tauri desktop shell (sidecar)
+
+### Work Completed
+
+- Scaffolded a Tauri v2 desktop app in `src-tauri/` (excluded from the cargo
+  workspace so tests/CI stay light) with a dependency-free static frontend in
+  `ui/` (status banner, generate form, render-to-docx).
+- Sidecar approach: the shell spawns the bundled `govdoc-api` on launch via
+  `tauri-plugin-shell`, mirrors its output, and kills it on `RunEvent::Exit`.
+  The webview calls `http://127.0.0.1:8000` (permissive CORS).
+- `scripts/prepare_sidecar.sh` builds `govdoc-api --release` and places it at
+  `src-tauri/binaries/govdoc-api-<triple>`; `scripts/desktop_dev.sh` runs the
+  whole thing. Generated app icons from a stdlib-rendered source PNG.
+- Verified live on macOS (aarch64): `cargo build` of the shell succeeds, and
+  `cargo tauri dev` launches the app, which spawns the sidecar — `/status`
+  answered through the Tauri-managed process.
+
+### Validation
+
+The Tauri crate compiles (`cargo build --manifest-path src-tauri/Cargo.toml`)
+and runs (`cargo tauri dev`). The Rust workspace (35 tests) is unchanged.
+
+### Follow-ups
+
+- If the shell is hard-killed, the sidecar can linger (the exit handler does not
+  run); consider parent-death cleanup (watch parent PID / process group).
+- Document persistence + generate progress streaming (still pending) would make
+  the UI more useful.
+- Taking an in-app screenshot here needs macOS Screen Recording permission,
+  which was not granted; functional verification was done via the API instead.
+
 ## 2026-06-07 (later) — Tauri-readiness (CORS + /status)
 
 ### Context

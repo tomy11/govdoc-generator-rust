@@ -1,0 +1,17 @@
+[package]
+name = "govdoc-desktop"
+version = "0.1.0"
+edition = "2021"
+description = "Tauri desktop shell for govdoc-generator"
+license = "MIT"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-shell = "2"
+
+[features]
+# Default feature so `tauri dev`/`tauri build` work without custom flags.
+custom-protocol = ["tauri/custom-protocol"]

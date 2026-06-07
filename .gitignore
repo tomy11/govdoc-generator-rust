@@ -24,5 +24,7 @@
 
 # Desktop build artifacts
 /src-tauri/target
+/src-tauri/gen
+/src-tauri/binaries
 /dist
 /build

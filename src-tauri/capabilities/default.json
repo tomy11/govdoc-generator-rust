@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Core permissions for the main window. The frontend uses plain HTTP (fetch) to the sidecar, so no extra plugin permissions are needed here.",
+  "windows": ["main"],
+  "permissions": ["core:default"]
+}

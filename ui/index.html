@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="th">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>GovDoc Generator</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <header>
+      <h1>โปรแกรมร่างหนังสือราชการ</h1>
+      <div id="status" class="status" title="สถานะ backend">กำลังเชื่อมต่อ…</div>
+    </header>
+
+    <main>
+      <section class="card">
+        <h2>สร้างหนังสือ</h2>
+        <form id="gen-form">
+          <div class="row">
+            <label>ประเภท
+              <select name="doc_type">
+                <option value="ภายนอก">หนังสือภายนอก</option>
+                <option value="ภายใน">หนังสือภายใน</option>
+                <option value="คำสั่ง">คำสั่ง</option>
+                <option value="ประกาศ">ประกาศ</option>
+              </select>
+            </label>
+            <label>ระดับผู้รับ
+              <select name="recipient_class">
+                <option value="general">ทั่วไป</option>
+                <option value="executive">ผู้บริหาร</option>
+                <option value="monk">พระสงฆ์</option>
+                <option value="royal">พระราชวงศ์</option>
+              </select>
+            </label>
+          </div>
+
+          <label>เรื่อง
+            <input name="subject" placeholder="เช่น ขอเชิญร่วมงานวันเด็กแห่งชาติ" required />
+          </label>
+          <label>จุดประสงค์
+            <input name="purpose" placeholder="เช่น แจ้งกำหนดการและขอความร่วมมือ" />
+          </label>
+
+          <div class="row">
+            <label>ผู้รับ
+              <input name="recipient_name" placeholder="เช่น ผู้อำนวยการเขตพื้นที่" />
+            </label>
+            <label>หน่วยงานผู้รับ
+              <input name="recipient_agency" placeholder="(ถ้ามี)" />
+            </label>
+          </div>
+
+          <div class="row">
+            <label>ผู้ลงนาม
+              <input name="sender_name" placeholder="เช่น นายสมชาย รักเรียน" />
+            </label>
+            <label>ตำแหน่ง
+              <input name="sender_position" placeholder="เช่น ผู้อำนวยการโรงเรียน" />
+            </label>
+          </div>
+
+          <label>บริบทเพิ่มเติม
+            <textarea name="additional_context" rows="2" placeholder="(ถ้ามี)"></textarea>
+          </label>
+
+          <div class="row between">
+            <label class="checkbox">
+              <input type="checkbox" name="use_critic" /> ตรวจทานด้วย critic (ช้ากว่า)
+            </label>
+            <button type="submit" id="gen-btn">สร้างหนังสือ</button>
+          </div>
+        </form>
+      </section>
+
+      <section class="card">
+        <div class="row between">
+          <h2>ผลลัพธ์</h2>
+          <button id="render-btn" disabled>บันทึกเป็น .docx</button>
+        </div>
+        <div id="result" class="result muted">ยังไม่มีผลลัพธ์ — กรอกฟอร์มแล้วกด “สร้างหนังสือ”</div>
+        <details id="trace-wrap" hidden>
+          <summary>ขั้นตอนการทำงาน (trace)</summary>
+          <pre id="trace"></pre>
+        </details>
+      </section>
+    </main>
+
+    <script src="app.js"></script>
+  </body>
+</html>

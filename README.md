@@ -48,6 +48,26 @@ directory is loaded automatically (shell env wins over `.env`). Copy
 than passing them on the command line. Set `SQLITE_PATH` to persist templates
 and ingested examples across restarts; without it the store is in-memory only.
 
+## Desktop App (Tauri)
+
+A Tauri v2 desktop shell lives in `src-tauri/` with a dependency-free static
+frontend in `ui/`. It uses the **sidecar** approach: the app bundles the
+`govdoc-api` binary, spawns it on launch (and kills it on exit), and the webview
+talks to it over `http://127.0.0.1:8000` (permissive CORS makes this work).
+
+The shell is excluded from the cargo workspace (heavy, platform-specific deps),
+so `cargo test --workspace` and CI are unaffected.
+
+```bash
+# one-time: cargo install tauri-cli --version "^2.0" --locked
+./scripts/desktop_dev.sh        # builds the sidecar, then runs `cargo tauri dev`
+```
+
+`scripts/prepare_sidecar.sh` builds `govdoc-api --release` and places it at
+`src-tauri/binaries/govdoc-api-<target-triple>` (gitignored) where Tauri expects
+it. Configure the runtime (cloud vs local backends) via `.env` as usual — the
+sidecar inherits it. For a distributable bundle: `cargo tauri build`.
+
 ## API Surface
 
 The local API currently exposes:

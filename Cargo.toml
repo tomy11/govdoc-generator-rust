@@ -5,6 +5,9 @@ members = [
     "crates/govdoc-storage",
     "crates/govdoc-api",
 ]
+# The Tauri desktop shell is built separately (cargo tauri ...) and pulls heavy,
+# platform-specific deps, so keep it out of `cargo test --workspace` and CI.
+exclude = ["src-tauri"]
 resolver = "2"
 
 [workspace.package]
