@@ -22,8 +22,9 @@ use govdoc_domain::{
     RenderRequest,
 };
 use govdoc_storage::{
-    DocumentRecord, DocumentSummary, NewMemoryRecord, NewTemplateRecord, PersistentVectorIndex,
-    SqliteStore, TemplateRecord,
+    DocumentRecord, DocumentSummary, GeneralDocumentPage, GeneralDocumentSummary,
+    NewGeneralDocument, NewMemoryRecord, NewTemplateRecord, PersistentVectorIndex, SqliteStore,
+    TemplateRecord,
 };
 use govdoc_usecases::{
     edit_document_json, generate_document_json, structure_document_from_text, EmbeddingProvider,
@@ -346,6 +347,26 @@ pub fn router(state: AppState) -> Router {
                 .put(update_document)
                 .delete(delete_document),
         )
+        .route(
+            "/general-documents",
+            get(list_general_documents).post(upload_general_document),
+        )
+        .route("/general-documents/upload", post(upload_general_document))
+        .route("/general-documents/:id", get(get_general_document))
+        .route(
+            "/general-documents/:id/pages/:page",
+            get(get_general_document_page),
+        )
+        .route("/general-documents/:id/ocr", post(ocr_general_document))
+        .route("/general-documents/:id/edit", post(edit_general_document))
+        .route(
+            "/general-documents/:id/export/docx",
+            post(export_general_docx),
+        )
+        .route(
+            "/general-documents/:id/export/pdf",
+            post(export_general_pdf),
+        )
         // Allow up to 25 MB uploads (scanned PDFs, .docx templates).
         .layer(DefaultBodyLimit::max(25 * 1024 * 1024))
         // Permissive CORS: the API binds to localhost only and is consumed by
@@ -408,6 +429,14 @@ async fn api_index() -> Json<Value> {
             { "method": "GET",  "path": "/documents/:id",     "desc": "Get one saved document" },
             { "method": "PUT",  "path": "/documents/:id",     "body": "SaveDocumentRequest", "desc": "Replace one saved document" },
             { "method": "DELETE","path": "/documents/:id",    "desc": "Delete a saved document" },
+            { "method": "POST", "path": "/general-documents/upload", "body": "multipart file", "desc": "Upload a general PDF/image document" },
+            { "method": "GET",  "path": "/general-documents", "desc": "List general documents" },
+            { "method": "GET",  "path": "/general-documents/:id", "desc": "Get general document metadata and page summaries" },
+            { "method": "GET",  "path": "/general-documents/:id/pages/:page", "desc": "Get one OCR/edited page" },
+            { "method": "POST", "path": "/general-documents/:id/ocr", "desc": "OCR general document pages" },
+            { "method": "POST", "path": "/general-documents/:id/edit", "body": "GeneralEditRequest", "desc": "Edit/check OCR text by page range" },
+            { "method": "POST", "path": "/general-documents/:id/export/docx", "desc": "Export general document to DOCX" },
+            { "method": "POST", "path": "/general-documents/:id/export/pdf", "desc": "Export general document to PDF" },
             { "method": "GET",  "path": "/templates",         "query": "doc_type, agency", "desc": "List templates" },
             { "method": "POST", "path": "/templates",         "body": "TemplateCreateRequest", "desc": "Register a template by file path" },
             { "method": "POST", "path": "/templates/upload",  "body": "multipart (file, doc_type, name)", "desc": "Upload a .docx render template" },
@@ -1113,6 +1142,261 @@ async fn delete_document(
     }
 }
 
+const GENERAL_DOC_MAX_PAGES: usize = 20;
+const GENERAL_DOCS_DIR: &str = "app-data/general-documents";
+
+#[derive(Debug, Serialize)]
+struct GeneralDocumentListResponse {
+    id: i64,
+    filename: String,
+    page_count: i64,
+    status: String,
+    created_at: String,
+    updated_at: String,
+}
+
+#[derive(Debug, Serialize)]
+struct GeneralPageResponse {
+    page_number: i64,
+    status: String,
+    ocr_text: Option<String>,
+    edited_text: Option<String>,
+    error: Option<String>,
+    updated_at: String,
+}
+
+#[derive(Debug, Serialize)]
+struct GeneralDocumentResponse {
+    id: i64,
+    filename: String,
+    page_count: i64,
+    status: String,
+    created_at: String,
+    updated_at: String,
+    pages: Vec<GeneralPageResponse>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GeneralEditRequest {
+    instruction: String,
+    page: Option<i64>,
+    all_pages: Option<bool>,
+}
+
+#[derive(Debug, Serialize)]
+struct GeneralActionResponse {
+    id: i64,
+    status: String,
+}
+
+async fn upload_general_document(
+    State(state): State<AppState>,
+    multipart: Multipart,
+) -> Result<Json<GeneralActionResponse>, ApiError> {
+    let upload = Upload::collect(multipart).await?;
+    let (filename, bytes) = upload.file()?;
+    validate_general_file(filename, bytes)?;
+    let page_count = estimate_page_count(filename, bytes)?;
+    if page_count > GENERAL_DOC_MAX_PAGES {
+        return Err(ApiError {
+            status: StatusCode::BAD_REQUEST,
+            detail: format!("รองรับสูงสุด {GENERAL_DOC_MAX_PAGES} หน้า (ไฟล์นี้ประมาณ {page_count} หน้า)"),
+        });
+    }
+
+    let dir =
+        optional_env("GOVDOC_GENERAL_DOCS_DIR").unwrap_or_else(|| GENERAL_DOCS_DIR.to_string());
+    std::fs::create_dir_all(&dir).map_err(io_error)?;
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let path = format!("{dir}/{millis}_{}", sanitize_filename(filename));
+    std::fs::write(&path, bytes).map_err(io_error)?;
+
+    let store = lock_store(&state)?;
+    let id = store
+        .create_general_document(NewGeneralDocument {
+            filename,
+            file_path: &path,
+            page_count: page_count as i64,
+        })
+        .map_err(internal_error)?;
+    Ok(Json(GeneralActionResponse {
+        id,
+        status: "pending".to_string(),
+    }))
+}
+
+async fn list_general_documents(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<GeneralDocumentListResponse>>, ApiError> {
+    let store = lock_store(&state)?;
+    let docs = store.list_general_documents().map_err(internal_error)?;
+    Ok(Json(docs.into_iter().map(Into::into).collect()))
+}
+
+async fn get_general_document(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<Json<GeneralDocumentResponse>, ApiError> {
+    let store = lock_store(&state)?;
+    let doc = store
+        .get_general_document(id)
+        .map_err(internal_error)?
+        .ok_or_else(|| not_found("general document", id))?;
+    let pages = store
+        .list_general_document_pages(id)
+        .map_err(internal_error)?
+        .into_iter()
+        .map(Into::into)
+        .collect();
+    Ok(Json(GeneralDocumentResponse::from_parts(doc, pages)))
+}
+
+async fn get_general_document_page(
+    State(state): State<AppState>,
+    Path((id, page)): Path<(i64, i64)>,
+) -> Result<Json<GeneralPageResponse>, ApiError> {
+    let store = lock_store(&state)?;
+    let page = store
+        .get_general_document_page(id, page)
+        .map_err(internal_error)?
+        .ok_or_else(|| not_found("general document page", id))?;
+    Ok(Json(page.into()))
+}
+
+async fn ocr_general_document(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<Json<GeneralActionResponse>, ApiError> {
+    let doc = {
+        let store = lock_store(&state)?;
+        store
+            .get_general_document(id)
+            .map_err(internal_error)?
+            .ok_or_else(|| not_found("general document", id))?
+    };
+    let bytes = std::fs::read(&doc.file_path).map_err(io_error)?;
+    let ocr = state.build_ocr()?;
+
+    for page in 1..=doc.page_count {
+        {
+            let store = lock_store(&state)?;
+            store
+                .update_general_page_ocr(id, page, "running", None, None)
+                .map_err(internal_error)?;
+        }
+
+        let result = ocr
+            .extract_text_page(&bytes, &doc.filename, Some(page as usize))
+            .await;
+        {
+            let store = lock_store(&state)?;
+            match result {
+                Ok(text) => store
+                    .update_general_page_ocr(id, page, "succeeded", Some(&text), None)
+                    .map_err(internal_error)?,
+                Err(err) => store
+                    .update_general_page_ocr(id, page, "failed", None, Some(&err.to_string()))
+                    .map_err(internal_error)?,
+            }
+        }
+        if page < doc.page_count {
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        }
+    }
+
+    let status = lock_store(&state)?
+        .get_general_document(id)
+        .map_err(internal_error)?
+        .map(|doc| doc.status)
+        .unwrap_or_else(|| "unknown".to_string());
+    Ok(Json(GeneralActionResponse { id, status }))
+}
+
+async fn edit_general_document(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Json(req): Json<GeneralEditRequest>,
+) -> Result<Json<GeneralActionResponse>, ApiError> {
+    if req.instruction.trim().is_empty() {
+        return Err(ApiError {
+            status: StatusCode::BAD_REQUEST,
+            detail: "instruction is required".to_string(),
+        });
+    }
+    let pages = {
+        let store = lock_store(&state)?;
+        ensure_general_document(&store, id)?;
+        store
+            .list_general_document_pages(id)
+            .map_err(internal_error)?
+    };
+    let target_pages: Vec<_> = if req.all_pages.unwrap_or(false) {
+        pages
+    } else {
+        let page = req.page.unwrap_or(1);
+        pages
+            .into_iter()
+            .filter(|item| item.page_number == page)
+            .collect()
+    };
+    if target_pages.is_empty() {
+        return Err(ApiError {
+            status: StatusCode::BAD_REQUEST,
+            detail: "no pages selected".to_string(),
+        });
+    }
+
+    let editor = state.build_llm()?;
+    for page in target_pages {
+        let source = page
+            .edited_text
+            .as_deref()
+            .or(page.ocr_text.as_deref())
+            .unwrap_or("");
+        let edited = edit_general_text(editor.as_ref(), source, &req.instruction).await?;
+        let store = lock_store(&state)?;
+        store
+            .save_general_revision(id, page.page_number, &req.instruction, &edited)
+            .map_err(internal_error)?;
+    }
+
+    let status = lock_store(&state)?
+        .get_general_document(id)
+        .map_err(internal_error)?
+        .map(|doc| doc.status)
+        .unwrap_or_else(|| "unknown".to_string());
+    Ok(Json(GeneralActionResponse { id, status }))
+}
+
+async fn export_general_docx(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<Json<RenderSaveResponse>, ApiError> {
+    let (doc, pages) = general_export_payload(&state, id)?;
+    let bytes = build_simple_docx(&doc.filename, &pages)?;
+    let file_path = save_export_bytes(&bytes, "docx")?;
+    Ok(Json(RenderSaveResponse {
+        file_path: file_path.display().to_string(),
+        bytes: bytes.len(),
+    }))
+}
+
+async fn export_general_pdf(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<Json<RenderSaveResponse>, ApiError> {
+    let (doc, pages) = general_export_payload(&state, id)?;
+    let bytes = build_simple_pdf(&doc.filename, &pages);
+    let file_path = save_export_bytes(&bytes, "pdf")?;
+    Ok(Json(RenderSaveResponse {
+        file_path: file_path.display().to_string(),
+        bytes: bytes.len(),
+    }))
+}
+
 fn lock_store(state: &AppState) -> Result<std::sync::MutexGuard<'_, SqliteStore>, ApiError> {
     state.template_store.lock().map_err(|_| ApiError {
         status: StatusCode::INTERNAL_SERVER_ERROR,
@@ -1120,6 +1404,7 @@ fn lock_store(state: &AppState) -> Result<std::sync::MutexGuard<'_, SqliteStore>
     })
 }
 
+#[derive(Debug)]
 struct ApiError {
     status: StatusCode,
     detail: String,
@@ -1173,11 +1458,264 @@ impl From<DocumentRecord> for DocumentResponse {
     }
 }
 
+impl From<GeneralDocumentSummary> for GeneralDocumentListResponse {
+    fn from(doc: GeneralDocumentSummary) -> Self {
+        Self {
+            id: doc.id,
+            filename: doc.filename,
+            page_count: doc.page_count,
+            status: doc.status,
+            created_at: doc.created_at,
+            updated_at: doc.updated_at,
+        }
+    }
+}
+
+impl GeneralDocumentResponse {
+    fn from_parts(doc: GeneralDocumentSummary, pages: Vec<GeneralPageResponse>) -> Self {
+        Self {
+            id: doc.id,
+            filename: doc.filename,
+            page_count: doc.page_count,
+            status: doc.status,
+            created_at: doc.created_at,
+            updated_at: doc.updated_at,
+            pages,
+        }
+    }
+}
+
+impl From<GeneralDocumentPage> for GeneralPageResponse {
+    fn from(page: GeneralDocumentPage) -> Self {
+        Self {
+            page_number: page.page_number,
+            status: page.status,
+            ocr_text: page.ocr_text,
+            edited_text: page.edited_text,
+            error: page.error,
+            updated_at: page.updated_at,
+        }
+    }
+}
+
 fn internal_error(err: anyhow::Error) -> ApiError {
     ApiError {
         status: StatusCode::INTERNAL_SERVER_ERROR,
         detail: err.to_string(),
     }
+}
+
+fn not_found(kind: &str, id: i64) -> ApiError {
+    ApiError {
+        status: StatusCode::NOT_FOUND,
+        detail: format!("{kind} {id} not found"),
+    }
+}
+
+fn ensure_general_document(store: &SqliteStore, id: i64) -> Result<(), ApiError> {
+    store
+        .get_general_document(id)
+        .map_err(internal_error)?
+        .map(|_| ())
+        .ok_or_else(|| not_found("general document", id))
+}
+
+fn validate_general_file(filename: &str, bytes: &[u8]) -> Result<(), ApiError> {
+    let lower = filename.to_lowercase();
+    let supported = lower.ends_with(".pdf")
+        || lower.ends_with(".png")
+        || lower.ends_with(".jpg")
+        || lower.ends_with(".jpeg");
+    if !supported {
+        return Err(ApiError {
+            status: StatusCode::BAD_REQUEST,
+            detail: "รองรับเฉพาะ PDF, PNG, JPG, JPEG".to_string(),
+        });
+    }
+    if bytes.is_empty() {
+        return Err(ApiError {
+            status: StatusCode::BAD_REQUEST,
+            detail: "uploaded file is empty".to_string(),
+        });
+    }
+    Ok(())
+}
+
+fn estimate_page_count(filename: &str, bytes: &[u8]) -> Result<usize, ApiError> {
+    if !filename.to_lowercase().ends_with(".pdf") {
+        return Ok(1);
+    }
+    let text = String::from_utf8_lossy(bytes);
+    let count = text
+        .matches("/Type /Page")
+        .count()
+        .saturating_sub(text.matches("/Type /Pages").count());
+    Ok(count.max(1))
+}
+
+async fn edit_general_text(
+    editor: &dyn LlmProvider,
+    text: &str,
+    instruction: &str,
+) -> Result<String, ApiError> {
+    let prompt = format!(
+        "คำสั่ง: {instruction}\n\nข้อความต้นฉบับ:\n{text}\n\nส่งกลับเฉพาะข้อความที่แก้แล้ว รักษาโครงย่อหน้า หัวข้อ ตาราง markdown และลำดับบรรทัดเดิมให้มากที่สุด"
+    );
+    editor
+        .complete(
+            "คุณคือผู้ช่วยตรวจคำผิดและจัดรูปแบบเอกสารทั่วไป รักษา layout เชิงข้อความให้มากที่สุด",
+            &prompt,
+            4096,
+        )
+        .await
+        .map_err(|err| ApiError {
+            status: StatusCode::BAD_GATEWAY,
+            detail: format!("general document edit failed: {err}"),
+        })
+}
+
+fn general_export_payload(
+    state: &AppState,
+    id: i64,
+) -> Result<(GeneralDocumentSummary, Vec<GeneralDocumentPage>), ApiError> {
+    let store = lock_store(state)?;
+    let doc = store
+        .get_general_document(id)
+        .map_err(internal_error)?
+        .ok_or_else(|| not_found("general document", id))?;
+    let pages = store
+        .list_general_document_pages(id)
+        .map_err(internal_error)?;
+    Ok((doc, pages))
+}
+
+fn page_text(page: &GeneralDocumentPage) -> String {
+    page.edited_text
+        .clone()
+        .or_else(|| page.ocr_text.clone())
+        .unwrap_or_else(|| format!("[หน้า {} ยังไม่มีข้อความ OCR]", page.page_number))
+}
+
+fn save_export_bytes(bytes: &[u8], extension: &str) -> Result<PathBuf, ApiError> {
+    let dir = render_exports_dir();
+    std::fs::create_dir_all(&dir).map_err(io_error)?;
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let mut path = dir.join(format!("general-document-{millis}.{extension}"));
+    let mut counter = 2;
+    while path.exists() {
+        path = dir.join(format!("general-document-{millis}-{counter}.{extension}"));
+        counter += 1;
+    }
+    std::fs::write(&path, bytes).map_err(io_error)?;
+    Ok(path)
+}
+
+fn build_simple_docx(filename: &str, pages: &[GeneralDocumentPage]) -> Result<Vec<u8>, ApiError> {
+    let base = std::env::temp_dir().join(format!(
+        "govdoc-docx-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0)
+    ));
+    let word_dir = base.join("word");
+    let rels_dir = base.join("_rels");
+    std::fs::create_dir_all(&word_dir).map_err(io_error)?;
+    std::fs::create_dir_all(&rels_dir).map_err(io_error)?;
+    std::fs::write(
+        base.join("[Content_Types].xml"),
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/></Types>"#,
+    )
+    .map_err(io_error)?;
+    std::fs::write(
+        rels_dir.join(".rels"),
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/></Relationships>"#,
+    )
+    .map_err(io_error)?;
+
+    let mut body = format!("<w:p><w:r><w:t>{}</w:t></w:r></w:p>", xml_escape(filename));
+    for page in pages {
+        body.push_str(&format!(
+            r#"<w:p><w:r><w:br w:type="page"/><w:t>หน้า {}</w:t></w:r></w:p>"#,
+            page.page_number
+        ));
+        for line in page_text(page).lines() {
+            body.push_str(&format!(
+                "<w:p><w:r><w:t>{}</w:t></w:r></w:p>",
+                xml_escape(line)
+            ));
+        }
+    }
+    let document_xml = format!(
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>{body}<w:sectPr/></w:body></w:document>"#
+    );
+    std::fs::write(word_dir.join("document.xml"), document_xml).map_err(io_error)?;
+
+    let output = Command::new("/usr/bin/zip")
+        .arg("-qr")
+        .arg("out.docx")
+        .arg("[Content_Types].xml")
+        .arg("_rels")
+        .arg("word")
+        .current_dir(&base)
+        .output()
+        .map_err(io_error)?;
+    if !output.status.success() {
+        return Err(ApiError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            detail: "failed to package DOCX".to_string(),
+        });
+    }
+    let bytes = std::fs::read(base.join("out.docx")).map_err(io_error)?;
+    let _ = std::fs::remove_dir_all(base);
+    Ok(bytes)
+}
+
+fn build_simple_pdf(filename: &str, pages: &[GeneralDocumentPage]) -> Vec<u8> {
+    let mut content = format!("BT /F1 14 Tf 50 780 Td ({}) Tj ET\n", pdf_escape(filename));
+    let mut y = 750;
+    for page in pages {
+        content.push_str(&format!(
+            "BT /F1 12 Tf 50 {y} Td (Page {}) Tj ET\n",
+            page.page_number
+        ));
+        y -= 18;
+        for line in page_text(page).lines().take(34) {
+            content.push_str(&format!(
+                "BT /F1 10 Tf 50 {y} Td ({}) Tj ET\n",
+                pdf_escape(line)
+            ));
+            y -= 16;
+            if y < 60 {
+                break;
+            }
+        }
+        content.push_str("BT /F1 1 Tf 50 40 Td ( ) Tj ET\n");
+        y = 750;
+    }
+    let stream_len = content.len();
+    format!(
+        "%PDF-1.4\n1 0 obj << /Type /Catalog /Pages 2 0 R >> endobj\n2 0 obj << /Type /Pages /Kids [3 0 R] /Count 1 >> endobj\n3 0 obj << /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >> endobj\n4 0 obj << /Type /Font /Subtype /Type1 /BaseFont /Helvetica >> endobj\n5 0 obj << /Length {stream_len} >> stream\n{content}endstream endobj\ntrailer << /Root 1 0 R >>\n%%EOF\n"
+    )
+    .into_bytes()
+}
+
+fn xml_escape(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+fn pdf_escape(text: &str) -> String {
+    text.chars()
+        .filter(|c| c.is_ascii())
+        .collect::<String>()
+        .replace('\\', "\\\\")
+        .replace('(', "\\(")
+        .replace(')', "\\)")
 }
 
 fn validate_render_doc(req: &RenderRequest) -> Result<(), ApiError> {
@@ -1357,6 +1895,37 @@ mod tests {
         );
         assert_eq!(sanitize_filename("a\\b\\c.docx"), "c.docx");
         assert_eq!(sanitize_filename(""), "template.docx");
+    }
+
+    #[test]
+    fn estimates_general_pdf_page_count() {
+        let mut pdf = b"%PDF-1.4 /Type /Pages".to_vec();
+        for _ in 0..20 {
+            pdf.extend_from_slice(b" /Type /Page ");
+        }
+        assert_eq!(estimate_page_count("manual.pdf", &pdf).unwrap(), 20);
+
+        pdf.extend_from_slice(b" /Type /Page ");
+        assert!(estimate_page_count("manual.pdf", &pdf).unwrap() > GENERAL_DOC_MAX_PAGES);
+        assert_eq!(estimate_page_count("scan.png", b"image").unwrap(), 1);
+    }
+
+    #[test]
+    fn general_export_builders_return_files() {
+        let pages = vec![GeneralDocumentPage {
+            id: 1,
+            document_id: 1,
+            page_number: 1,
+            status: "succeeded".to_string(),
+            ocr_text: Some("Heading\nBody text".to_string()),
+            edited_text: None,
+            error: None,
+            updated_at: "now".to_string(),
+        }];
+        let docx = build_simple_docx("manual.pdf", &pages).unwrap();
+        let pdf = build_simple_pdf("manual.pdf", &pages);
+        assert!(docx.starts_with(b"PK"));
+        assert!(pdf.starts_with(b"%PDF"));
     }
 
     #[tokio::test]

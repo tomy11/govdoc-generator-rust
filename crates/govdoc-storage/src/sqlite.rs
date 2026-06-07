@@ -57,6 +57,35 @@ pub struct DocumentSummary {
     pub created_at: String,
 }
 
+pub struct NewGeneralDocument<'a> {
+    pub filename: &'a str,
+    pub file_path: &'a str,
+    pub page_count: i64,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct GeneralDocumentSummary {
+    pub id: i64,
+    pub filename: String,
+    pub file_path: String,
+    pub page_count: i64,
+    pub status: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct GeneralDocumentPage {
+    pub id: i64,
+    pub document_id: i64,
+    pub page_number: i64,
+    pub status: String,
+    pub ocr_text: Option<String>,
+    pub edited_text: Option<String>,
+    pub error: Option<String>,
+    pub updated_at: String,
+}
+
 impl SqliteStore {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let conn = Connection::open(path)?;
@@ -105,6 +134,39 @@ impl SqliteStore {
                 title TEXT,
                 doc_json TEXT NOT NULL,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+
+            CREATE TABLE IF NOT EXISTS general_document (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                filename TEXT NOT NULL,
+                file_path TEXT NOT NULL,
+                page_count INTEGER NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+
+            CREATE TABLE IF NOT EXISTS general_document_page (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                document_id INTEGER NOT NULL,
+                page_number INTEGER NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                ocr_text TEXT,
+                edited_text TEXT,
+                error TEXT,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(document_id, page_number),
+                FOREIGN KEY(document_id) REFERENCES general_document(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS general_document_revision (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                document_id INTEGER NOT NULL,
+                page_number INTEGER NOT NULL,
+                instruction TEXT NOT NULL,
+                text TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY(document_id) REFERENCES general_document(id) ON DELETE CASCADE
             );
             "#,
         )?;
@@ -464,6 +526,133 @@ impl SqliteStore {
         };
         Ok(())
     }
+
+    pub fn create_general_document(&self, record: NewGeneralDocument<'_>) -> Result<i64> {
+        self.conn.execute(
+            "INSERT INTO general_document (filename, file_path, page_count) VALUES (?1, ?2, ?3)",
+            params![record.filename, record.file_path, record.page_count],
+        )?;
+        let id = self.conn.last_insert_rowid();
+        for page in 1..=record.page_count {
+            self.conn.execute(
+                "INSERT INTO general_document_page (document_id, page_number) VALUES (?1, ?2)",
+                params![id, page],
+            )?;
+        }
+        Ok(id)
+    }
+
+    pub fn list_general_documents(&self) -> Result<Vec<GeneralDocumentSummary>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, filename, file_path, page_count, status, created_at, updated_at FROM general_document ORDER BY id DESC",
+        )?;
+        let rows = stmt.query_map([], general_document_from_row)?;
+        rows.collect::<rusqlite::Result<_>>().map_err(Into::into)
+    }
+
+    pub fn get_general_document(&self, id: i64) -> Result<Option<GeneralDocumentSummary>> {
+        self.conn
+            .query_row(
+                "SELECT id, filename, file_path, page_count, status, created_at, updated_at FROM general_document WHERE id = ?1",
+                params![id],
+                general_document_from_row,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn list_general_document_pages(
+        &self,
+        document_id: i64,
+    ) -> Result<Vec<GeneralDocumentPage>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, document_id, page_number, status, ocr_text, edited_text, error, updated_at FROM general_document_page WHERE document_id = ?1 ORDER BY page_number",
+        )?;
+        let rows = stmt.query_map(params![document_id], general_page_from_row)?;
+        rows.collect::<rusqlite::Result<_>>().map_err(Into::into)
+    }
+
+    pub fn get_general_document_page(
+        &self,
+        document_id: i64,
+        page_number: i64,
+    ) -> Result<Option<GeneralDocumentPage>> {
+        self.conn
+            .query_row(
+                "SELECT id, document_id, page_number, status, ocr_text, edited_text, error, updated_at FROM general_document_page WHERE document_id = ?1 AND page_number = ?2",
+                params![document_id, page_number],
+                general_page_from_row,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn update_general_page_ocr(
+        &self,
+        document_id: i64,
+        page_number: i64,
+        status: &str,
+        text: Option<&str>,
+        error: Option<&str>,
+    ) -> Result<()> {
+        self.conn.execute(
+            "UPDATE general_document_page SET status = ?1, ocr_text = ?2, error = ?3, updated_at = CURRENT_TIMESTAMP WHERE document_id = ?4 AND page_number = ?5",
+            params![status, text, error, document_id, page_number],
+        )?;
+        self.update_general_document_status(document_id)?;
+        Ok(())
+    }
+
+    pub fn save_general_revision(
+        &self,
+        document_id: i64,
+        page_number: i64,
+        instruction: &str,
+        text: &str,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO general_document_revision (document_id, page_number, instruction, text) VALUES (?1, ?2, ?3, ?4)",
+            params![document_id, page_number, instruction, text],
+        )?;
+        self.conn.execute(
+            "UPDATE general_document_page SET edited_text = ?1, updated_at = CURRENT_TIMESTAMP WHERE document_id = ?2 AND page_number = ?3",
+            params![text, document_id, page_number],
+        )?;
+        self.update_general_document_status(document_id)?;
+        Ok(())
+    }
+
+    fn update_general_document_status(&self, document_id: i64) -> Result<()> {
+        let total: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM general_document_page WHERE document_id = ?1",
+            params![document_id],
+            |row| row.get(0),
+        )?;
+        let succeeded: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM general_document_page WHERE document_id = ?1 AND status = 'succeeded'",
+            params![document_id],
+            |row| row.get(0),
+        )?;
+        let failed: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM general_document_page WHERE document_id = ?1 AND status = 'failed'",
+            params![document_id],
+            |row| row.get(0),
+        )?;
+        let status = if total > 0 && succeeded == total {
+            "succeeded"
+        } else if failed > 0 {
+            "partial"
+        } else if succeeded > 0 {
+            "running"
+        } else {
+            "pending"
+        };
+        self.conn.execute(
+            "UPDATE general_document SET status = ?1, updated_at = CURRENT_TIMESTAMP WHERE id = ?2",
+            params![status, document_id],
+        )?;
+        Ok(())
+    }
 }
 
 fn template_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TemplateRecord> {
@@ -474,6 +663,31 @@ fn template_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TemplateRecord
         name: row.get(3)?,
         file_path: row.get(4)?,
         is_default: row.get::<_, i64>(5)? == 1,
+    })
+}
+
+fn general_document_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<GeneralDocumentSummary> {
+    Ok(GeneralDocumentSummary {
+        id: row.get(0)?,
+        filename: row.get(1)?,
+        file_path: row.get(2)?,
+        page_count: row.get(3)?,
+        status: row.get(4)?,
+        created_at: row.get(5)?,
+        updated_at: row.get(6)?,
+    })
+}
+
+fn general_page_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<GeneralDocumentPage> {
+    Ok(GeneralDocumentPage {
+        id: row.get(0)?,
+        document_id: row.get(1)?,
+        page_number: row.get(2)?,
+        status: row.get(3)?,
+        ocr_text: row.get(4)?,
+        edited_text: row.get(5)?,
+        error: row.get(6)?,
+        updated_at: row.get(7)?,
     })
 }
 
@@ -659,6 +873,41 @@ mod tests {
         assert!(store.delete_document(id).unwrap());
         assert!(!store.delete_document(id).unwrap()); // already gone
         assert_eq!(store.list_documents(None).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn stores_general_documents_pages_and_revisions() {
+        let store = SqliteStore::open_memory().unwrap();
+        let id = store
+            .create_general_document(NewGeneralDocument {
+                filename: "manual.pdf",
+                file_path: "app-data/general-documents/manual.pdf",
+                page_count: 2,
+            })
+            .unwrap();
+
+        let docs = store.list_general_documents().unwrap();
+        assert_eq!(docs.len(), 1);
+        assert_eq!(docs[0].page_count, 2);
+
+        let pages = store.list_general_document_pages(id).unwrap();
+        assert_eq!(pages.len(), 2);
+        assert_eq!(pages[0].status, "pending");
+
+        store
+            .update_general_page_ocr(id, 1, "succeeded", Some("ข้อความหน้า 1"), None)
+            .unwrap();
+        store
+            .save_general_revision(id, 1, "ตรวจคำผิด", "ข้อความหน้า 1 แก้แล้ว")
+            .unwrap();
+
+        let page = store.get_general_document_page(id, 1).unwrap().unwrap();
+        assert_eq!(page.ocr_text.as_deref(), Some("ข้อความหน้า 1"));
+        assert_eq!(page.edited_text.as_deref(), Some("ข้อความหน้า 1 แก้แล้ว"));
+        assert_eq!(
+            store.get_general_document(id).unwrap().unwrap().status,
+            "running"
+        );
     }
 
     #[test]

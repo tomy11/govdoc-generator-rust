@@ -292,6 +292,15 @@ impl TyphoonOcrProvider {
     /// Extract text/markdown from an image or PDF. Returns the natural text of
     /// every successfully processed page, joined by blank lines.
     pub async fn extract_text(&self, file: &[u8], filename: &str) -> anyhow::Result<String> {
+        self.extract_text_page(file, filename, None).await
+    }
+
+    pub async fn extract_text_page(
+        &self,
+        file: &[u8],
+        filename: &str,
+        page_num: Option<usize>,
+    ) -> anyhow::Result<String> {
         let key = self
             .config
             .api_key
@@ -308,6 +317,11 @@ impl TyphoonOcrProvider {
             .text("temperature", "0.1")
             .text("top_p", "0.6")
             .text("repetition_penalty", "1.2");
+        let form = if let Some(page_num) = page_num {
+            form.text("page_num", page_num.to_string())
+        } else {
+            form
+        };
 
         let response = self
             .client

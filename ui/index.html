@@ -124,7 +124,46 @@
       </section>
 
       <section class="card wide">
-        <h2>อัปโหลดต้นแบบ</h2>
+        <div class="row between">
+          <h2>เอกสารทั่วไป</h2>
+          <button id="refresh-general-docs" class="ghost">รีเฟรช</button>
+        </div>
+        <form id="general-upload-form" class="upload-box">
+          <h3>อัปโหลดคู่มือ / เอกสารทั่วไป</h3>
+          <p class="muted small">รองรับ PDF/PNG/JPEG สูงสุด 20 หน้า และ 25 MB ใช้ OCR รายหน้าแล้ว export ได้ทั้ง DOCX/PDF</p>
+          <input type="file" name="file" accept="application/pdf,image/png,image/jpeg" required />
+          <button type="submit">อัปโหลดเอกสาร</button>
+          <div class="upload-msg muted small"></div>
+        </form>
+        <ul id="general-doc-list" class="doc-list"><li class="muted">กำลังโหลด…</li></ul>
+        <section id="general-doc-detail" class="inline-detail general-detail" hidden>
+          <div class="row between">
+            <h3 id="general-detail-title">เอกสารทั่วไป</h3>
+            <div class="btn-group">
+              <button id="general-ocr-btn" type="button">OCR ใหม่</button>
+              <button id="general-export-docx-btn" type="button" class="ghost">Export DOCX</button>
+              <button id="general-export-pdf-btn" type="button" class="ghost">Export PDF</button>
+            </div>
+          </div>
+          <div id="general-action-msg" class="action-msg muted small"></div>
+          <div class="general-layout">
+            <ul id="general-page-list" class="page-list"></ul>
+            <div>
+              <textarea id="general-page-text" class="json-editor" rows="14" spellcheck="false"></textarea>
+              <label>คำสั่งแก้ไข
+                <textarea id="general-edit-instruction" rows="2" placeholder="เช่น ตรวจคำผิดและจัดย่อหน้าให้เรียบร้อย"></textarea>
+              </label>
+              <div class="btn-group">
+                <button id="general-edit-page-btn" type="button">แก้หน้าปัจจุบัน</button>
+                <button id="general-edit-all-btn" type="button" class="ghost">แก้ทั้งเอกสาร</button>
+              </div>
+            </div>
+          </div>
+        </section>
+      </section>
+
+      <section class="card wide">
+        <h2>อัปโหลดต้นแบบหนังสือราชการ</h2>
         <div class="upload-grid">
           <form id="example-form" class="upload-box">
             <h3>ตัวอย่างให้ AI เลียนแบบ</h3>
