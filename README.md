@@ -54,6 +54,7 @@ The local API currently exposes:
 
 - `GET /` or `GET /docs` (JSON endpoint index; no Swagger UI)
 - `GET /health`
+- `GET /status` (active backends + readiness, for the UI)
 - `POST /generate`
 - `POST /edit`
 - `POST /render`
@@ -62,6 +63,10 @@ The local API currently exposes:
 - `GET /templates`
 - `POST /templates`
 - `GET /templates/default`
+
+CORS is permissive (the API binds to localhost and is meant to run as a Tauri
+sidecar / local tool), so a desktop webview can call it cross-origin. `GET
+/status` reports which backends are active so the UI can guide setup.
 
 Generation and editing are wired through provider traits. The backend is
 selected at startup by `LLM_BACKEND`:

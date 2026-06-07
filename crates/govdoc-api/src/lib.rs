@@ -30,6 +30,7 @@ use govdoc_usecases::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use tower_http::cors::CorsLayer;
 
 use crate::memory::SqliteMemoryRepository;
 use crate::mock::{FakeEmbeddingProvider, FakeLlmProvider};
@@ -272,6 +273,7 @@ pub fn router(state: AppState) -> Router {
         .route("/", get(api_index))
         .route("/docs", get(api_index))
         .route("/health", get(health))
+        .route("/status", get(status))
         .route("/generate", post(generate))
         .route("/edit", post(edit))
         .route("/render", post(render))
@@ -279,6 +281,9 @@ pub fn router(state: AppState) -> Router {
         .route("/ingest/ocr", post(ingest_ocr))
         .route("/templates", get(list_templates).post(create_template))
         .route("/templates/default", get(resolve_default_template))
+        // Permissive CORS: the API binds to localhost only and is consumed by
+        // the Tauri webview / local tools, so any local origin is acceptable.
+        .layer(CorsLayer::permissive())
         .with_state(state)
 }
 
@@ -289,6 +294,32 @@ async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
     })
 }
 
+/// Report the active backends so a UI can show configuration and flag anything
+/// that still needs setup (e.g. a cloud key). Backs the hybrid runtime: the
+/// frontend can tell whether the LLM/embedding/OCR are fake, local, or cloud.
+async fn status(State(state): State<AppState>) -> Json<Value> {
+    let (llm_backend, llm_ready) = match &state.llm_backend {
+        LlmBackend::Fake => ("fake", true),
+        LlmBackend::TyphoonLocal(_) => ("typhoon-local", true),
+        LlmBackend::TyphoonCloud(config) => ("typhoon-cloud", config.api_key.is_some()),
+    };
+    let embedding_backend = match &state.embedding_backend {
+        EmbeddingBackend::Fake => "fake",
+        EmbeddingBackend::Remote(_) => "remote",
+    };
+    let ocr_ready = OcrConfig::from_env().api_key.is_some();
+    let persistent = std::env::var("SQLITE_PATH").is_ok_and(|p| !p.is_empty());
+
+    Json(serde_json::json!({
+        "app": state.app_name,
+        "llm": { "backend": llm_backend, "ready": llm_ready },
+        "embedding": { "backend": embedding_backend },
+        "ocr": { "ready": ocr_ready },
+        "renderer_configured": state.renderer_cmd.is_some(),
+        "persistent": persistent,
+    }))
+}
+
 /// Lightweight endpoint index served at `/` and `/docs`. The Axum port does not
 /// ship a Swagger UI like the FastAPI original, so this lists the routes and
 /// their request body types instead.
@@ -297,6 +328,7 @@ async fn api_index() -> Json<Value> {
         "app": "govdoc-generator-rust",
         "endpoints": [
             { "method": "GET",  "path": "/health",            "desc": "Health check" },
+            { "method": "GET",  "path": "/status",            "desc": "Active backends (llm/embedding/ocr) and readiness" },
             { "method": "POST", "path": "/generate",          "body": "DocRequest",    "desc": "Generate a Thai government document" },
             { "method": "POST", "path": "/edit",              "body": "EditRequest",   "desc": "Edit document fields" },
             { "method": "POST", "path": "/render",            "body": "RenderRequest", "desc": "Render a document to .docx via the sidecar" },
@@ -859,6 +891,27 @@ mod tests {
     #[tokio::test]
     async fn builds_router() {
         let _router = router(AppState::default());
+    }
+
+    #[tokio::test]
+    async fn status_reports_default_backends() {
+        let app = router(AppState::default());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/status")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["llm"]["backend"], "fake");
+        assert_eq!(json["embedding"]["backend"], "fake");
     }
 
     #[tokio::test]

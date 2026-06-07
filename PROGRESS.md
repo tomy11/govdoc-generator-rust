@@ -1,5 +1,39 @@
 # Progress Log
 
+## 2026-06-07 (later) — Tauri-readiness (CORS + /status)
+
+### Context
+
+There is no UI in this repo yet — only the HTTP API. Decided to target a Tauri
+desktop app via the **sidecar HTTP** approach (bundle `govdoc-api`, webview
+calls localhost) with a **hybrid** model runtime (cloud or local per backend
+env). These changes prep the API for that.
+
+### Work Completed
+
+- Added a permissive `CorsLayer` so the desktop webview can call the localhost
+  API cross-origin (verified: preflight returns `access-control-allow-origin: *`).
+- Added `GET /status` reporting the active backends (llm/embedding/ocr) and
+  readiness (e.g. cloud key present, persistence on), so the UI can show config
+  and flag setup gaps. Added to the `/docs` index; unit tested.
+
+### Validation
+
+`cargo clippy -p govdoc-api --all-targets -- -D warnings` and the api test suite
+(16 tests) pass.
+
+### Next (Tauri build, not yet started)
+
+- Scaffold `src-tauri` + a frontend; bundle `govdoc-api` as a sidecar and manage
+  its lifecycle.
+- Document persistence: a `documents` table + save/list/get endpoints so the UI
+  can show generated-document history (generate currently does not persist its
+  output).
+- Optional generate progress streaming (SSE) for slow local models.
+- Replace the Python sidecars for a distributable build (hybrid): keep cloud as
+  the light default; for local, move toward a bundled llama.cpp binary, a
+  Rust-native embedding, and native docx rendering to avoid bundling Python.
+
 ## 2026-06-07 (later) — Persistent vector index + CI
 
 ### Work Completed
