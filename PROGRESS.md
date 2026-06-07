@@ -1,5 +1,29 @@
 # Progress Log
 
+## 2026-06-07 (later) — Persistent vector index + CI
+
+### Work Completed
+
+- Added `PersistentVectorIndex` (`crates/govdoc-storage/src/vector_index.rs`): a
+  per-doc-type cosine index serialized to `HNSW_INDEX_PATH`. It is loaded at
+  startup, updated on ingest, and rebuilt from SQLite (`memory_vectors`) when the
+  file is missing/corrupt. SQLite stays the source of truth; the index is a
+  derived cache, so retrieval no longer reloads and rebuilds per query. Search is
+  still brute-force cosine (the `HnswIndex` name is aspirational; a real HNSW can
+  slot in behind it later). Unit tested for doc-type-scoped search and
+  disk reload.
+- Wired it through `AppState` (`open_index`), `SqliteMemoryRepository`, and the
+  ingest path (writes SQLite then the index, no nested locks).
+- Verified live: ingest with real bge-m3 embeddings writes the index file, and a
+  restarted process loads it and serves retrieval (`examples: 1`).
+- Added `.github/workflows/ci.yml`: fmt check, clippy (`-D warnings`), test, and
+  release build on push/PR (ubuntu, stable, cargo cache). Added a CI badge.
+
+### Validation
+
+`cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D
+warnings`, and `cargo test --workspace` (35 tests, 0 failures) all pass.
+
 ## 2026-06-07 (later) — Structure OCR text via LLM
 
 ### Work Completed

@@ -177,6 +177,27 @@ impl SqliteStore {
             .collect()
     }
 
+    /// All stored `(id, doc_type, embedding)` triples, for rebuilding the
+    /// persistent vector index from the source-of-truth database.
+    pub fn memory_vectors(&self) -> Result<Vec<(i64, String, Vec<f32>)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, doc_type, embedding FROM gov_doc_memory WHERE embedding IS NOT NULL",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (id, doc_type, json) = row?;
+            out.push((id, doc_type, serde_json::from_str::<Vec<f32>>(&json)?));
+        }
+        Ok(out)
+    }
+
     /// Fetch `fields_json` for the given ids, preserving the input order.
     pub fn memory_fields_by_ids(&self, ids: &[i64]) -> Result<Vec<Value>> {
         let mut fields = Vec::with_capacity(ids.len());

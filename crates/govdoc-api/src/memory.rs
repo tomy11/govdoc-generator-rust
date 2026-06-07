@@ -1,26 +1,29 @@
-//! `MemoryRepository` backed by the shared SQLite store.
+//! `MemoryRepository` backed by the shared SQLite store and persistent vector
+//! index.
 //!
-//! Similarity search builds an in-memory cosine index from the embeddings
-//! stored alongside each example, looks up the nearest ids, then returns their
-//! `fields_json`. When no embeddings exist for the requested doc type it falls
-//! back to the most recent examples so generation still gets context.
+//! SQLite holds the example documents and their embeddings (source of truth);
+//! the vector index answers similarity queries without reloading and rebuilding
+//! from the database each time. When the index has no match for a doc type the
+//! repository falls back to the most recent examples so generation still gets
+//! context.
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 
 use anyhow::anyhow;
 use async_trait::async_trait;
 use govdoc_domain::DocRequest;
-use govdoc_storage::{HnswIndex, InMemoryVectorIndex, SqliteStore};
+use govdoc_storage::{PersistentVectorIndex, SqliteStore};
 use govdoc_usecases::MemoryRepository;
 use serde_json::Value;
 
 pub struct SqliteMemoryRepository {
     store: Arc<Mutex<SqliteStore>>,
+    index: Arc<RwLock<PersistentVectorIndex>>,
 }
 
 impl SqliteMemoryRepository {
-    pub fn new(store: Arc<Mutex<SqliteStore>>) -> Self {
-        Self { store }
+    pub fn new(store: Arc<Mutex<SqliteStore>>, index: Arc<RwLock<PersistentVectorIndex>>) -> Self {
+        Self { store, index }
     }
 }
 
@@ -40,26 +43,22 @@ impl MemoryRepository for SqliteMemoryRepository {
         embedding: &[f32],
         limit: usize,
     ) -> anyhow::Result<Vec<Value>> {
+        let doc_type = req.doc_type.as_thai();
+        let ids = {
+            let index = self
+                .index
+                .read()
+                .map_err(|_| anyhow!("vector index lock poisoned"))?;
+            index.search(doc_type, embedding, limit)
+        };
+
         let store = self
             .store
             .lock()
             .map_err(|_| anyhow!("memory store lock poisoned"))?;
-        let doc_type = req.doc_type.as_thai();
-
-        let pairs = store.memory_embeddings(Some(doc_type))?;
-        if pairs.is_empty() {
+        if ids.is_empty() {
             return store.recent_memory_fields(Some(doc_type), limit);
         }
-
-        let mut index = InMemoryVectorIndex::default();
-        for (id, vector) in &pairs {
-            index.add(*id, vector)?;
-        }
-        let ids: Vec<i64> = index
-            .search(embedding, limit)?
-            .into_iter()
-            .map(|hit| hit.id)
-            .collect();
         store.memory_fields_by_ids(&ids)
     }
 }
@@ -83,6 +82,12 @@ mod tests {
             additional_context: String::new(),
             use_critic: None,
         }
+    }
+
+    fn repo_from(store: SqliteStore) -> SqliteMemoryRepository {
+        let mut index = PersistentVectorIndex::default();
+        index.rebuild(store.memory_vectors().unwrap()).unwrap();
+        SqliteMemoryRepository::new(Arc::new(Mutex::new(store)), Arc::new(RwLock::new(index)))
     }
 
     #[tokio::test]
@@ -113,7 +118,7 @@ mod tests {
             })
             .unwrap();
 
-        let repo = SqliteMemoryRepository::new(Arc::new(Mutex::new(store)));
+        let repo = repo_from(store);
         let hits = repo
             .retrieve_by_similarity(&request(DocType::External), &[0.9, 0.1], 1)
             .await
@@ -139,7 +144,7 @@ mod tests {
             })
             .unwrap();
 
-        let repo = SqliteMemoryRepository::new(Arc::new(Mutex::new(store)));
+        let repo = repo_from(store);
         let hits = repo
             .retrieve_by_similarity(&request(DocType::External), &[0.1, 0.2], 3)
             .await

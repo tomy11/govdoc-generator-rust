@@ -3,8 +3,9 @@ mod mock;
 mod providers;
 
 use std::io::Write;
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 
 use anyhow::Context;
 
@@ -20,7 +21,9 @@ use govdoc_domain::{
     AnnouncementDoc, DocRequest, DocType, EditRequest, ExternalDoc, InternalDoc, OrderDoc,
     RenderRequest,
 };
-use govdoc_storage::{NewMemoryRecord, NewTemplateRecord, SqliteStore, TemplateRecord};
+use govdoc_storage::{
+    NewMemoryRecord, NewTemplateRecord, PersistentVectorIndex, SqliteStore, TemplateRecord,
+};
 use govdoc_usecases::{
     edit_document_json, generate_document_json, structure_document_from_text, EmbeddingProvider,
     GenerationOptions, GenerationServices, LlmProvider, TraceEvent,
@@ -86,6 +89,7 @@ impl EmbeddingBackend {
 pub struct AppState {
     pub app_name: String,
     template_store: Arc<Mutex<SqliteStore>>,
+    vector_index: Arc<RwLock<PersistentVectorIndex>>,
     renderer_cmd: Option<String>,
     python_source: Option<String>,
     llm_backend: LlmBackend,
@@ -94,9 +98,12 @@ pub struct AppState {
 
 impl Default for AppState {
     fn default() -> Self {
+        let template_store = Arc::new(Mutex::new(open_store()));
+        let vector_index = Arc::new(RwLock::new(open_index(&template_store)));
         Self {
             app_name: "govdoc-generator-rust".to_string(),
-            template_store: Arc::new(Mutex::new(open_store())),
+            template_store,
+            vector_index,
             renderer_cmd: std::env::var("GOVDOC_RENDERER_CMD").ok(),
             python_source: std::env::var("GOVDOC_PYTHON_SOURCE").ok(),
             llm_backend: LlmBackend::from_env(),
@@ -121,6 +128,26 @@ fn open_store() -> SqliteStore {
         }
         _ => SqliteStore::open_memory().expect("in-memory SQLite store should open"),
     }
+}
+
+/// Load the vector index from `HNSW_INDEX_PATH`, rebuilding it from SQLite
+/// (the source of truth) when the file is missing or empty.
+fn open_index(store: &Arc<Mutex<SqliteStore>>) -> PersistentVectorIndex {
+    let path = std::env::var("HNSW_INDEX_PATH")
+        .ok()
+        .filter(|p| !p.is_empty())
+        .map(PathBuf::from);
+    let mut index = PersistentVectorIndex::load(path);
+    if index.is_empty() {
+        if let Ok(store) = store.lock() {
+            if let Ok(rows) = store.memory_vectors() {
+                if !rows.is_empty() {
+                    let _ = index.rebuild(rows);
+                }
+            }
+        }
+    }
+    index
 }
 
 impl AppState {
@@ -151,9 +178,9 @@ impl AppState {
         }
     }
 
-    /// Memory repository over the shared SQLite store.
+    /// Memory repository over the shared SQLite store and vector index.
     fn memory_repo(&self) -> SqliteMemoryRepository {
-        SqliteMemoryRepository::new(self.template_store.clone())
+        SqliteMemoryRepository::new(self.template_store.clone(), self.vector_index.clone())
     }
 
     /// Embed text for storage. Returns `None` for the fake backend so retrieval
@@ -491,22 +518,38 @@ fn store_memory_record(
     raw_text: Option<&str>,
     embedding: Option<&[f32]>,
 ) -> Result<i64, ApiError> {
-    let store = state.template_store.lock().map_err(|_| ApiError {
-        status: StatusCode::INTERNAL_SERVER_ERROR,
-        detail: "memory store lock poisoned".to_string(),
-    })?;
-    store
-        .store_memory(NewMemoryRecord {
-            doc_type: doc_type.as_thai(),
-            summary_text: summary,
-            fields,
-            recipient_class,
-            agency,
-            template_id: None,
-            raw_text,
-            embedding,
-        })
-        .map_err(internal_error)
+    // Write to SQLite (source of truth), releasing the lock before touching the
+    // index to avoid holding two locks at once.
+    let id = {
+        let store = state.template_store.lock().map_err(|_| ApiError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            detail: "memory store lock poisoned".to_string(),
+        })?;
+        store
+            .store_memory(NewMemoryRecord {
+                doc_type: doc_type.as_thai(),
+                summary_text: summary,
+                fields,
+                recipient_class,
+                agency,
+                template_id: None,
+                raw_text,
+                embedding,
+            })
+            .map_err(internal_error)?
+    };
+
+    if let Some(vector) = embedding {
+        let mut index = state.vector_index.write().map_err(|_| ApiError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            detail: "vector index lock poisoned".to_string(),
+        })?;
+        index
+            .add(id, doc_type.as_thai(), vector.to_vec())
+            .map_err(internal_error)?;
+    }
+
+    Ok(id)
 }
 
 /// Build a retrieval summary from a structured document when none was supplied.

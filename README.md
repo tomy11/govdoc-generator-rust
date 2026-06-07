@@ -1,5 +1,7 @@
 # govdoc-generator-rust
 
+[![CI](https://github.com/tomy11/govdoc-generator-rust/actions/workflows/ci.yml/badge.svg)](https://github.com/tomy11/govdoc-generator-rust/actions/workflows/ci.yml)
+
 Rust workspace for a desktop-first Thai government document generator.
 
 This project is a Rust port of `govdoc-generator`, with a local-first storage
@@ -89,10 +91,13 @@ backend is chosen by `EMBEDDING_BACKEND`:
   `TyphoonEmbeddingProvider` (`EMBEDDING_BASE_URL`/`EMBEDDING_MODEL`, with the
   API key reused from `LLM_API_KEY`).
 
-Examples are stored in SQLite (`gov_doc_memory`) with their embeddings;
-`SqliteMemoryRepository` builds an in-memory cosine index per request and
-returns the nearest examples. The store starts empty — populate it via the
-ingestion endpoints below.
+Examples are stored in SQLite (`gov_doc_memory`) with their embeddings.
+`SqliteMemoryRepository` answers similarity queries from a persistent vector
+index (`HNSW_INDEX_PATH`) that is loaded at startup, updated on ingest, and
+rebuilt from SQLite when missing. SQLite stays the source of truth; the index is
+a derived cache. Search is a brute-force cosine scan (fine at desktop scale; a
+true HNSW graph can replace the internals later). The store starts empty —
+populate it via the ingestion endpoints below.
 
 ## Ingestion
 
