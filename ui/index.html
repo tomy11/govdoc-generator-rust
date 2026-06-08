@@ -186,6 +186,7 @@
               </label>
               <div class="btn-group">
                 <button id="general-edit-page-btn" type="button">แก้หน้าปัจจุบัน</button>
+                <button id="general-edit-block-btn" type="button" class="ghost" disabled>แก้ block ที่เลือก</button>
                 <button id="general-edit-all-btn" type="button" class="ghost">แก้ทั้งเอกสาร</button>
               </div>
             </div>
@@ -237,6 +238,13 @@
       </section>
     </main>
 
-    <script src="app.js"></script>
+    <!-- Loaded in order as classic scripts sharing one global scope; main.js
+         must come last because it bootstraps the initial render. -->
+    <script src="js/state.js"></script>
+    <script src="js/utils.js"></script>
+    <script src="js/official-docs.js"></script>
+    <script src="js/general-docs.js"></script>
+    <script src="js/uploads.js"></script>
+    <script src="js/main.js"></script>
   </body>
 </html>

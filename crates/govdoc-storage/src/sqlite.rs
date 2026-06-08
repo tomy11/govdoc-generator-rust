@@ -636,11 +636,32 @@ impl SqliteStore {
             .map_err(Into::into)
     }
 
+    pub fn delete_general_document(&self, id: i64) -> Result<bool> {
+        let affected = self
+            .conn
+            .execute("DELETE FROM general_document WHERE id = ?1", params![id])?;
+        Ok(affected > 0)
+    }
+
     pub fn update_general_document_file_path(&self, id: i64, file_path: &str) -> Result<()> {
         self.conn.execute(
             "UPDATE general_document SET file_path = ?1, updated_at = CURRENT_TIMESTAMP WHERE id = ?2",
             params![file_path, id],
         )?;
+        Ok(())
+    }
+
+    pub fn ensure_general_document_pages(&self, document_id: i64, page_count: i64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE general_document SET page_count = MAX(page_count, ?1), updated_at = CURRENT_TIMESTAMP WHERE id = ?2",
+            params![page_count, document_id],
+        )?;
+        for page in 1..=page_count {
+            self.conn.execute(
+                "INSERT OR IGNORE INTO general_document_page (document_id, page_number) VALUES (?1, ?2)",
+                params![document_id, page],
+            )?;
+        }
         Ok(())
     }
 
@@ -777,6 +798,20 @@ impl SqliteStore {
             }
         }
         Ok(blocks)
+    }
+
+    pub fn update_general_block_text(
+        &self,
+        document_id: i64,
+        page_number: i64,
+        block_index: i64,
+        text: &str,
+    ) -> Result<bool> {
+        let affected = self.conn.execute(
+            "UPDATE general_document_block SET text = ?1, updated_at = CURRENT_TIMESTAMP WHERE document_id = ?2 AND page_number = ?3 AND block_index = ?4",
+            params![text, document_id, page_number, block_index],
+        )?;
+        Ok(affected > 0)
     }
 
     pub fn save_general_revision(

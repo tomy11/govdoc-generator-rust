@@ -352,7 +352,14 @@ pub fn router(state: AppState) -> Router {
             get(list_general_documents).post(upload_general_document),
         )
         .route("/general-documents/upload", post(upload_general_document))
-        .route("/general-documents/:id", get(get_general_document))
+        .route(
+            "/general-documents/:id",
+            get(get_general_document).delete(delete_general_document),
+        )
+        .route(
+            "/general-documents/:id/delete",
+            post(delete_general_document),
+        )
         .route(
             "/general-documents/:id/pages/:page",
             get(get_general_document_page),
@@ -444,6 +451,7 @@ async fn api_index() -> Json<Value> {
             { "method": "POST", "path": "/general-documents/upload", "body": "multipart file", "desc": "Upload a general PDF/image document" },
             { "method": "GET",  "path": "/general-documents", "desc": "List general documents" },
             { "method": "GET",  "path": "/general-documents/:id", "desc": "Get general document metadata and page summaries" },
+            { "method": "DELETE", "path": "/general-documents/:id", "desc": "Delete a general document and its stored files" },
             { "method": "GET",  "path": "/general-documents/:id/pages/:page", "desc": "Get one OCR/edited page" },
             { "method": "GET",  "path": "/general-documents/:id/pages/:page/blocks", "desc": "List layout/text blocks for one page" },
             { "method": "GET",  "path": "/general-documents/:id/pages/:page/image", "desc": "Get rendered page image when available" },
@@ -1226,6 +1234,7 @@ struct GeneralDocumentResponse {
 struct GeneralEditRequest {
     instruction: String,
     page: Option<i64>,
+    block_index: Option<i64>,
     all_pages: Option<bool>,
 }
 
@@ -1331,6 +1340,36 @@ async fn get_general_document(
     Ok(Json(GeneralDocumentResponse::from_parts(doc, pages)))
 }
 
+async fn delete_general_document(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<StatusCode, ApiError> {
+    let doc = {
+        let store = lock_store(&state)?;
+        store
+            .get_general_document(id)
+            .map_err(internal_error)?
+            .ok_or_else(|| not_found("general document", id))?
+    };
+    {
+        let store = lock_store(&state)?;
+        if !store.delete_general_document(id).map_err(internal_error)? {
+            return Err(not_found("general document", id));
+        }
+    }
+    if let Some(dir) = general_document_dir(&doc) {
+        if dir.exists() {
+            std::fs::remove_dir_all(&dir).map_err(io_error)?;
+        }
+    } else {
+        let path = FsPath::new(&doc.file_path);
+        if path.exists() {
+            std::fs::remove_file(path).map_err(io_error)?;
+        }
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
 async fn get_general_document_page(
     State(state): State<AppState>,
     Path((id, page)): Path<(i64, i64)>,
@@ -1434,6 +1473,46 @@ async fn ocr_general_document(
             .ok_or_else(|| not_found("general document", id))?
     };
     let bytes = std::fs::read(&doc.file_path).map_err(io_error)?;
+    let repaired_page_count = estimate_page_count(&doc.filename, &bytes)? as i64;
+    if repaired_page_count > doc.page_count {
+        let doc_dir = FsPath::new(&doc.file_path)
+            .parent()
+            .and_then(FsPath::parent)
+            .map(FsPath::to_path_buf);
+        let store = lock_store(&state)?;
+        store
+            .ensure_general_document_pages(id, repaired_page_count)
+            .map_err(internal_error)?;
+        if let Some(doc_dir) = doc_dir {
+            let assets = prepare_general_page_images(
+                &doc_dir,
+                &doc.filename,
+                FsPath::new(&doc.file_path),
+                repaired_page_count as usize,
+            )?;
+            for asset in assets {
+                store
+                    .update_general_page_asset(
+                        id,
+                        asset.page_number,
+                        asset.path.as_deref(),
+                        asset.width,
+                        asset.height,
+                        asset.warning.as_deref(),
+                    )
+                    .map_err(internal_error)?;
+            }
+        }
+    }
+    let doc = if repaired_page_count > doc.page_count {
+        lock_store(&state)?
+            .get_general_document(id)
+            .map_err(internal_error)?
+            .ok_or_else(|| not_found("general document", id))?
+    } else {
+        doc
+    };
+    ensure_general_page_images_for_ocr(&state, id, &doc)?;
     let ocr = state.build_ocr()?;
 
     for page in 1..=doc.page_count {
@@ -1444,8 +1523,29 @@ async fn ocr_general_document(
                 .map_err(internal_error)?;
         }
 
+        let page_image_path = lock_store(&state)?
+            .get_general_document_page(id, page)
+            .map_err(internal_error)?
+            .and_then(|page| page.page_image_path);
+        let page_payload = page_image_path
+            .as_deref()
+            .and_then(|path| {
+                std::fs::read(path)
+                    .ok()
+                    .map(|page_bytes| (path, page_bytes))
+            })
+            .map(|(path, page_bytes)| {
+                let filename = FsPath::new(path)
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("page.png")
+                    .to_string();
+                (page_bytes, filename, None)
+            })
+            .unwrap_or_else(|| (bytes.clone(), doc.filename.clone(), Some(page as usize)));
+
         let result = match ocr
-            .extract_page(&bytes, &doc.filename, Some(page as usize))
+            .extract_page(&page_payload.0, &page_payload.1, page_payload.2)
             .await
         {
             Ok(output) => {
@@ -1515,6 +1615,52 @@ async fn edit_general_document(
                 .map_err(internal_error)?,
         )
     };
+    if let Some(block_index) = req.block_index {
+        let page_number = req.page.unwrap_or(1);
+        let block = all_blocks
+            .iter()
+            .find(|block| block.page_number == page_number && block.block_index == block_index)
+            .ok_or_else(|| ApiError {
+                status: StatusCode::BAD_REQUEST,
+                detail: format!("block {block_index} on page {page_number} not found"),
+            })?;
+        let source = block.text.as_deref().unwrap_or("");
+        let context = general_context_for_selected_block(block);
+        let editor = state.build_llm()?;
+        let edited = edit_general_text(editor.as_ref(), source, &req.instruction, &context).await?;
+        let page_text = {
+            let mut page_blocks: Vec<_> = all_blocks
+                .iter()
+                .filter(|block| block.page_number == page_number)
+                .cloned()
+                .collect();
+            for block in &mut page_blocks {
+                if block.block_index == block_index {
+                    block.text = Some(edited.clone());
+                }
+            }
+            page_text_from_blocks(&page_blocks).unwrap_or_else(|| edited.clone())
+        };
+        let store = lock_store(&state)?;
+        if !store
+            .update_general_block_text(id, page_number, block_index, &edited)
+            .map_err(internal_error)?
+        {
+            return Err(ApiError {
+                status: StatusCode::BAD_REQUEST,
+                detail: format!("block {block_index} on page {page_number} not found"),
+            });
+        }
+        store
+            .save_general_revision(id, page_number, &req.instruction, &page_text)
+            .map_err(internal_error)?;
+        let status = store
+            .get_general_document(id)
+            .map_err(internal_error)?
+            .map(|doc| doc.status)
+            .unwrap_or_else(|| "unknown".to_string());
+        return Ok(Json(GeneralActionResponse { id, status }));
+    }
     let target_pages: Vec<_> = if req.all_pages.unwrap_or(false) {
         pages
     } else {
@@ -1567,8 +1713,8 @@ async fn export_general_docx(
     State(state): State<AppState>,
     Path(id): Path<i64>,
 ) -> Result<Json<RenderSaveResponse>, ApiError> {
-    let (doc, pages) = general_export_payload(&state, id)?;
-    let bytes = build_simple_docx(&doc.filename, &pages)?;
+    let (doc, pages, blocks) = general_export_payload(&state, id)?;
+    let bytes = build_simple_docx(&doc.filename, &pages, &blocks)?;
     let file_path = save_export_bytes(&bytes, "docx")?;
     Ok(Json(RenderSaveResponse {
         file_path: file_path.display().to_string(),
@@ -1580,8 +1726,8 @@ async fn export_general_pdf(
     State(state): State<AppState>,
     Path(id): Path<i64>,
 ) -> Result<Json<RenderSaveResponse>, ApiError> {
-    let (doc, pages) = general_export_payload(&state, id)?;
-    let bytes = build_simple_pdf(&doc.filename, &pages);
+    let (doc, pages, blocks) = general_export_payload(&state, id)?;
+    let bytes = build_simple_pdf(&doc.filename, &pages, &blocks)?;
     let file_path = save_export_bytes(&bytes, "pdf")?;
     Ok(Json(RenderSaveResponse {
         file_path: file_path.display().to_string(),
@@ -1735,6 +1881,64 @@ fn ensure_general_document(store: &SqliteStore, id: i64) -> Result<(), ApiError>
         .ok_or_else(|| not_found("general document", id))
 }
 
+fn general_document_dir(doc: &GeneralDocumentSummary) -> Option<PathBuf> {
+    let path = FsPath::new(&doc.file_path);
+    let id = doc.id.to_string();
+    let parent = path.parent()?;
+    if parent.file_name().and_then(|name| name.to_str()) == Some("source") {
+        return parent.parent().map(FsPath::to_path_buf);
+    }
+    (parent.file_name().and_then(|name| name.to_str()) == Some(id.as_str()))
+        .then(|| parent.to_path_buf())
+}
+
+fn ensure_general_page_images_for_ocr(
+    state: &AppState,
+    id: i64,
+    doc: &GeneralDocumentSummary,
+) -> Result<(), ApiError> {
+    if !doc.filename.to_lowercase().ends_with(".pdf") {
+        return Ok(());
+    }
+    let pages = lock_store(state)?
+        .list_general_document_pages(id)
+        .map_err(internal_error)?;
+    if pages.iter().all(|page| {
+        page.page_image_path
+            .as_deref()
+            .is_some_and(|path| FsPath::new(path).exists())
+    }) {
+        return Ok(());
+    }
+    let Some(doc_dir) = FsPath::new(&doc.file_path)
+        .parent()
+        .and_then(FsPath::parent)
+        .map(FsPath::to_path_buf)
+    else {
+        return Ok(());
+    };
+    let assets = prepare_general_page_images(
+        &doc_dir,
+        &doc.filename,
+        FsPath::new(&doc.file_path),
+        doc.page_count as usize,
+    )?;
+    let store = lock_store(state)?;
+    for asset in assets {
+        store
+            .update_general_page_asset(
+                id,
+                asset.page_number,
+                asset.path.as_deref(),
+                asset.width,
+                asset.height,
+                asset.warning.as_deref(),
+            )
+            .map_err(internal_error)?;
+    }
+    Ok(())
+}
+
 fn rank_general_blocks(
     blocks: Vec<GeneralDocumentBlock>,
     query: &str,
@@ -1847,11 +2051,26 @@ fn estimate_page_count(filename: &str, bytes: &[u8]) -> Result<usize, ApiError> 
         return Ok(1);
     }
     let text = String::from_utf8_lossy(bytes);
-    let count = text
+    let direct_pages = text
         .matches("/Type /Page")
         .count()
         .saturating_sub(text.matches("/Type /Pages").count());
-    Ok(count.max(1))
+    let page_tree_count = max_pdf_count_value(&text);
+    Ok(direct_pages.max(page_tree_count).max(1))
+}
+
+fn max_pdf_count_value(text: &str) -> usize {
+    let mut max_count = 0;
+    let mut rest = text;
+    while let Some(index) = rest.find("/Count") {
+        rest = &rest[index + "/Count".len()..];
+        let trimmed = rest.trim_start();
+        let digits: String = trimmed.chars().take_while(|c| c.is_ascii_digit()).collect();
+        if let Ok(count) = digits.parse::<usize>() {
+            max_count = max_count.max(count);
+        }
+    }
+    max_count
 }
 
 struct PageImageAsset {
@@ -2084,6 +2303,23 @@ fn prepare_general_page_images(
         }]);
     }
 
+    if python_fitz_available() && render_pdf_pages_with_fitz(source_path, &pages_dir, page_count)? {
+        return Ok((1..=page_count)
+            .map(|page| PageImageAsset {
+                page_number: page as i64,
+                path: Some(
+                    pages_dir
+                        .join(format!("page-{page:03}.png"))
+                        .display()
+                        .to_string(),
+                ),
+                width: None,
+                height: None,
+                warning: None,
+            })
+            .collect());
+    }
+
     if command_exists("pdftoppm") {
         let prefix = pages_dir.join("rendered-page");
         let output = Command::new("pdftoppm")
@@ -2128,6 +2364,35 @@ fn prepare_general_page_images(
         }
     }
 
+    if command_exists("qlmanage") {
+        if let Some(first_page) = render_quicklook_preview(source_path, &pages_dir)? {
+            let mut assets = vec![PageImageAsset {
+                page_number: 1,
+                path: Some(first_page.display().to_string()),
+                width: None,
+                height: None,
+                warning: if page_count > 1 {
+                    Some(
+                        "QuickLook rendered only the first page; install pdftoppm for all page previews"
+                            .to_string(),
+                    )
+                } else {
+                    None
+                },
+            }];
+            assets.extend((2..=page_count).map(|page| PageImageAsset {
+                page_number: page as i64,
+                path: None,
+                width: None,
+                height: None,
+                warning: Some(
+                    "PDF page image rendering for this page requires pdftoppm".to_string(),
+                ),
+            }));
+            return Ok(assets);
+        }
+    }
+
     Ok((1..=page_count)
         .map(|page| PageImageAsset {
             page_number: page as i64,
@@ -2139,6 +2404,100 @@ fn prepare_general_page_images(
             ),
         })
         .collect())
+}
+
+fn render_quicklook_preview(
+    source_path: &FsPath,
+    pages_dir: &FsPath,
+) -> Result<Option<PathBuf>, ApiError> {
+    let before = list_png_files(pages_dir)?;
+    let output = Command::new("qlmanage")
+        .arg("-t")
+        .arg("-s")
+        .arg("1200")
+        .arg("-o")
+        .arg(pages_dir)
+        .arg(source_path)
+        .output()
+        .map_err(io_error)?;
+    if !output.status.success() {
+        return Ok(None);
+    }
+    let after = list_png_files(pages_dir)?;
+    let generated = after.into_iter().find(|path| !before.contains(path));
+    let Some(generated) = generated else {
+        return Ok(None);
+    };
+    let target = pages_dir.join("page-001.png");
+    if generated != target {
+        std::fs::rename(&generated, &target).map_err(io_error)?;
+    }
+    Ok(Some(target))
+}
+
+fn python_fitz_available() -> bool {
+    Command::new("python3")
+        .arg("-c")
+        .arg("import fitz")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+fn render_pdf_pages_with_fitz(
+    source_path: &FsPath,
+    pages_dir: &FsPath,
+    page_count: usize,
+) -> Result<bool, ApiError> {
+    let script = r#"
+import pathlib
+import sys
+import fitz
+
+source = sys.argv[1]
+out_dir = pathlib.Path(sys.argv[2])
+max_pages = int(sys.argv[3])
+doc = fitz.open(source)
+pages = min(len(doc), max_pages)
+for index in range(pages):
+    page = doc.load_page(index)
+    pix = page.get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False)
+    pix.save(out_dir / f"page-{index + 1:03}.png")
+print(pages)
+"#;
+    let output = Command::new("python3")
+        .arg("-c")
+        .arg(script)
+        .arg(source_path)
+        .arg(pages_dir)
+        .arg(page_count.to_string())
+        .output()
+        .map_err(io_error)?;
+    if !output.status.success() {
+        return Ok(false);
+    }
+    let rendered = String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .parse::<usize>()
+        .unwrap_or(0);
+    Ok(rendered >= page_count)
+}
+
+fn list_png_files(dir: &FsPath) -> Result<std::collections::HashSet<PathBuf>, ApiError> {
+    let mut files = std::collections::HashSet::new();
+    for entry in std::fs::read_dir(dir).map_err(io_error)? {
+        let entry = entry.map_err(io_error)?;
+        let path = entry.path();
+        if path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("png"))
+        {
+            files.insert(path);
+        }
+    }
+    Ok(files)
 }
 
 fn command_exists(name: &str) -> bool {
@@ -2199,10 +2558,28 @@ fn general_context_for_page(hits: &[(f32, GeneralDocumentBlock)], page_number: i
     }
 }
 
+fn general_context_for_selected_block(block: &GeneralDocumentBlock) -> String {
+    format!(
+        "page={} block={} type={} bbox={} text={}",
+        block.page_number,
+        block.block_index,
+        block.block_type,
+        block.bbox_json.as_deref().unwrap_or("-"),
+        block.text.as_deref().unwrap_or("")
+    )
+}
+
 fn general_export_payload(
     state: &AppState,
     id: i64,
-) -> Result<(GeneralDocumentSummary, Vec<GeneralDocumentPage>), ApiError> {
+) -> Result<
+    (
+        GeneralDocumentSummary,
+        Vec<GeneralDocumentPage>,
+        Vec<GeneralDocumentBlock>,
+    ),
+    ApiError,
+> {
     let store = lock_store(state)?;
     let doc = store
         .get_general_document(id)
@@ -2211,7 +2588,10 @@ fn general_export_payload(
     let pages = store
         .list_general_document_pages(id)
         .map_err(internal_error)?;
-    Ok((doc, pages))
+    let blocks = store
+        .list_general_document_blocks(id, None)
+        .map_err(internal_error)?;
+    Ok((doc, pages, blocks))
 }
 
 fn page_text(page: &GeneralDocumentPage) -> String {
@@ -2219,6 +2599,22 @@ fn page_text(page: &GeneralDocumentPage) -> String {
         .clone()
         .or_else(|| page.ocr_text.clone())
         .unwrap_or_else(|| format!("[หน้า {} ยังไม่มีข้อความ OCR]", page.page_number))
+}
+
+fn page_text_from_blocks(blocks: &[GeneralDocumentBlock]) -> Option<String> {
+    if blocks.is_empty() {
+        return None;
+    }
+    let mut ordered = blocks.to_vec();
+    ordered.sort_by_key(|block| block.block_index);
+    let text = ordered
+        .into_iter()
+        .filter_map(|block| block.text)
+        .map(|text| text.trim().to_string())
+        .filter(|text| !text.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    (!text.is_empty()).then_some(text)
 }
 
 fn save_export_bytes(bytes: &[u8], extension: &str) -> Result<PathBuf, ApiError> {
@@ -2238,7 +2634,11 @@ fn save_export_bytes(bytes: &[u8], extension: &str) -> Result<PathBuf, ApiError>
     Ok(path)
 }
 
-fn build_simple_docx(filename: &str, pages: &[GeneralDocumentPage]) -> Result<Vec<u8>, ApiError> {
+fn build_simple_docx(
+    filename: &str,
+    pages: &[GeneralDocumentPage],
+    blocks: &[GeneralDocumentBlock],
+) -> Result<Vec<u8>, ApiError> {
     let base = std::env::temp_dir().join(format!(
         "govdoc-docx-{}",
         std::time::SystemTime::now()
@@ -2267,11 +2667,27 @@ fn build_simple_docx(filename: &str, pages: &[GeneralDocumentPage]) -> Result<Ve
             r#"<w:p><w:r><w:br w:type="page"/><w:t>หน้า {}</w:t></w:r></w:p>"#,
             page.page_number
         ));
-        for line in page_text(page).lines() {
-            body.push_str(&format!(
-                "<w:p><w:r><w:t>{}</w:t></w:r></w:p>",
-                xml_escape(line)
-            ));
+        let page_blocks = blocks_for_page(blocks, page.page_number);
+        if page_blocks.is_empty() {
+            for line in page_text(page).lines() {
+                body.push_str(&docx_paragraph(line, false));
+            }
+        } else {
+            for block in page_blocks {
+                let text = block.text.as_deref().unwrap_or("").trim();
+                if text.is_empty() {
+                    continue;
+                }
+                match block.block_type.as_str() {
+                    "heading" => body.push_str(&docx_paragraph(text, true)),
+                    "table" | "table_cell" => body.push_str(&docx_table_or_paragraph(text)),
+                    _ => {
+                        for line in text.lines() {
+                            body.push_str(&docx_paragraph(line, false));
+                        }
+                    }
+                }
+            }
         }
     }
     let document_xml = format!(
@@ -2299,33 +2715,297 @@ fn build_simple_docx(filename: &str, pages: &[GeneralDocumentPage]) -> Result<Ve
     Ok(bytes)
 }
 
-fn build_simple_pdf(filename: &str, pages: &[GeneralDocumentPage]) -> Vec<u8> {
-    let mut content = format!("BT /F1 14 Tf 50 780 Td ({}) Tj ET\n", pdf_escape(filename));
-    let mut y = 750;
+fn blocks_for_page(blocks: &[GeneralDocumentBlock], page_number: i64) -> Vec<GeneralDocumentBlock> {
+    let mut page_blocks: Vec<_> = blocks
+        .iter()
+        .filter(|block| block.page_number == page_number)
+        .cloned()
+        .collect();
+    page_blocks.sort_by_key(|block| block.block_index);
+    page_blocks
+}
+
+fn docx_paragraph(text: &str, heading: bool) -> String {
+    if heading {
+        format!(
+            r#"<w:p><w:pPr><w:pStyle w:val="Heading1"/></w:pPr><w:r><w:b/><w:t>{}</w:t></w:r></w:p>"#,
+            xml_escape(text)
+        )
+    } else {
+        format!("<w:p><w:r><w:t>{}</w:t></w:r></w:p>", xml_escape(text))
+    }
+}
+
+fn docx_table_or_paragraph(text: &str) -> String {
+    let rows: Vec<Vec<String>> = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.starts_with('|') && line.ends_with('|'))
+        .map(|line| {
+            line.trim_matches('|')
+                .split('|')
+                .map(|cell| cell.trim().to_string())
+                .collect::<Vec<_>>()
+        })
+        .filter(|cells| {
+            !cells.is_empty()
+                && !cells.iter().all(|cell| {
+                    cell.chars()
+                        .all(|c| c == '-' || c == ':' || c.is_whitespace())
+                })
+        })
+        .collect();
+    if rows.is_empty() {
+        return docx_paragraph(text, false);
+    }
+    let mut xml = String::from("<w:tbl>");
+    for row in rows {
+        xml.push_str("<w:tr>");
+        for cell in row {
+            xml.push_str(&format!(
+                "<w:tc><w:p><w:r><w:t>{}</w:t></w:r></w:p></w:tc>",
+                xml_escape(&cell)
+            ));
+        }
+        xml.push_str("</w:tr>");
+    }
+    xml.push_str("</w:tbl>");
+    xml
+}
+
+fn build_simple_pdf(
+    filename: &str,
+    pages: &[GeneralDocumentPage],
+    blocks: &[GeneralDocumentBlock],
+) -> Result<Vec<u8>, ApiError> {
+    if let Some(bytes) = build_image_background_pdf(pages, blocks)? {
+        return Ok(bytes);
+    }
+    let font_obj = 3 + (pages.len() * 2);
+    let kids = pages
+        .iter()
+        .enumerate()
+        .map(|(index, _)| format!("{} 0 R", 3 + (index * 2)))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let mut objects = vec![
+        "<< /Type /Catalog /Pages 2 0 R >>".to_string(),
+        format!("<< /Type /Pages /Kids [{kids}] /Count {} >>", pages.len()),
+    ];
     for page in pages {
-        content.push_str(&format!(
-            "BT /F1 12 Tf 50 {y} Td (Page {}) Tj ET\n",
-            page.page_number
+        let content = pdf_page_content(filename, page, &blocks_for_page(blocks, page.page_number));
+        let content_obj = objects.len() + 2;
+        objects.push(format!(
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 {font_obj} 0 R >> >> /Contents {content_obj} 0 R >>"
         ));
-        y -= 18;
-        for line in page_text(page).lines().take(34) {
+        objects.push(format!(
+            "<< /Length {} >>\nstream\n{}endstream",
+            content.len(),
+            content
+        ));
+    }
+    objects.push("<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_string());
+
+    let mut pdf = String::from("%PDF-1.4\n");
+    let mut offsets = Vec::new();
+    for (index, object) in objects.iter().enumerate() {
+        offsets.push(pdf.len());
+        pdf.push_str(&format!("{} 0 obj\n{}\nendobj\n", index + 1, object));
+    }
+    let xref_at = pdf.len();
+    pdf.push_str(&format!(
+        "xref\n0 {}\n0000000000 65535 f \n",
+        objects.len() + 1
+    ));
+    for offset in offsets {
+        pdf.push_str(&format!("{offset:010} 00000 n \n"));
+    }
+    pdf.push_str(&format!(
+        "trailer << /Size {} /Root 1 0 R >>\nstartxref\n{xref_at}\n%%EOF\n",
+        objects.len() + 1
+    ));
+    Ok(pdf.into_bytes())
+}
+
+fn build_image_background_pdf(
+    pages: &[GeneralDocumentPage],
+    blocks: &[GeneralDocumentBlock],
+) -> Result<Option<Vec<u8>>, ApiError> {
+    if !command_exists("magick") || pages.iter().any(|page| page.page_image_path.is_none()) {
+        return Ok(None);
+    }
+    let base = std::env::temp_dir().join(format!(
+        "govdoc-pdf-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0)
+    ));
+    std::fs::create_dir_all(&base).map_err(io_error)?;
+    let mut rendered_pages = Vec::new();
+    for page in pages {
+        let output_path = base.join(format!("page-{:03}.png", page.page_number));
+        let Some(image_path) = page.page_image_path.as_deref() else {
+            return Ok(None);
+        };
+        let mut command = Command::new("magick");
+        command
+            .arg(image_path)
+            .arg("-resize")
+            .arg("595x842!")
+            .arg("-font")
+            .arg("Helvetica")
+            .arg("-pointsize")
+            .arg("10")
+            .arg("-fill")
+            .arg("black");
+        for block in blocks_for_page(blocks, page.page_number) {
+            let Some(text) = block
+                .text
+                .as_deref()
+                .map(str::trim)
+                .filter(|text| !text.is_empty())
+            else {
+                continue;
+            };
+            let Some((x, y, _, _)) = parse_bbox(block.bbox_json.as_deref()) else {
+                continue;
+            };
+            let page_width = page.page_width.unwrap_or(595).max(1) as f32;
+            let page_height = page.page_height.unwrap_or(842).max(1) as f32;
+            let draw_x = (595.0 * (x / page_width)).clamp(0.0, 570.0);
+            let draw_y = (842.0 * (y / page_height)).clamp(0.0, 820.0);
+            command
+                .arg("-annotate")
+                .arg(format!("+{draw_x:.0}+{draw_y:.0}"))
+                .arg(
+                    text.lines()
+                        .next()
+                        .unwrap_or("")
+                        .chars()
+                        .take(180)
+                        .collect::<String>(),
+                );
+        }
+        let status = command.arg(&output_path).status().map_err(io_error)?;
+        if !status.success() {
+            let _ = std::fs::remove_dir_all(&base);
+            return Ok(None);
+        }
+        rendered_pages.push(output_path);
+    }
+    let output_pdf = base.join("out.pdf");
+    let status = Command::new("magick")
+        .args(&rendered_pages)
+        .arg(&output_pdf)
+        .status()
+        .map_err(io_error)?;
+    if !status.success() {
+        let _ = std::fs::remove_dir_all(&base);
+        return Ok(None);
+    }
+    let bytes = std::fs::read(&output_pdf).map_err(io_error)?;
+    let _ = std::fs::remove_dir_all(&base);
+    Ok(Some(bytes))
+}
+
+fn pdf_page_content(
+    filename: &str,
+    page: &GeneralDocumentPage,
+    blocks: &[GeneralDocumentBlock],
+) -> String {
+    let mut content = format!(
+        "BT /F1 12 Tf 50 805 Td ({}) Tj ET\nBT /F1 9 Tf 50 790 Td (Page {}) Tj ET\n",
+        pdf_escape(filename),
+        page.page_number
+    );
+    let page_width = page.page_width.unwrap_or(595).max(1) as f32;
+    let page_height = page.page_height.unwrap_or(842).max(1) as f32;
+    let mut used_bbox = false;
+    for block in blocks {
+        let Some(text) = block
+            .text
+            .as_deref()
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+        else {
+            continue;
+        };
+        let Some((x, y, _, _)) = parse_bbox(block.bbox_json.as_deref()) else {
+            continue;
+        };
+        used_bbox = true;
+        let pdf_x = 595.0 * (x / page_width);
+        let pdf_y = 842.0 - (842.0 * (y / page_height));
+        for (line_index, line) in text.lines().take(6).enumerate() {
+            let line_y = (pdf_y - (line_index as f32 * 12.0)).clamp(40.0, 810.0);
+            content.push_str(&format!(
+                "BT /F1 9 Tf {:.1} {:.1} Td ({}) Tj ET\n",
+                pdf_x.clamp(20.0, 560.0),
+                line_y,
+                pdf_escape(line)
+            ));
+        }
+    }
+    if !used_bbox {
+        let mut y = 760;
+        for line in page_text(page).lines().take(42) {
             content.push_str(&format!(
                 "BT /F1 10 Tf 50 {y} Td ({}) Tj ET\n",
                 pdf_escape(line)
             ));
             y -= 16;
-            if y < 60 {
+            if y < 50 {
                 break;
             }
         }
-        content.push_str("BT /F1 1 Tf 50 40 Td ( ) Tj ET\n");
-        y = 750;
     }
-    let stream_len = content.len();
-    format!(
-        "%PDF-1.4\n1 0 obj << /Type /Catalog /Pages 2 0 R >> endobj\n2 0 obj << /Type /Pages /Kids [3 0 R] /Count 1 >> endobj\n3 0 obj << /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >> endobj\n4 0 obj << /Type /Font /Subtype /Type1 /BaseFont /Helvetica >> endobj\n5 0 obj << /Length {stream_len} >> stream\n{content}endstream endobj\ntrailer << /Root 1 0 R >>\n%%EOF\n"
-    )
-    .into_bytes()
+    content
+}
+
+fn parse_bbox(raw: Option<&str>) -> Option<(f32, f32, f32, f32)> {
+    let value = serde_json::from_str::<Value>(raw?).ok()?;
+    if let Some(items) = value.as_array() {
+        if items.len() >= 4 {
+            let x = items[0].as_f64()? as f32;
+            let y = items[1].as_f64()? as f32;
+            let third = items[2].as_f64()? as f32;
+            let fourth = items[3].as_f64()? as f32;
+            let width = if third > x { third - x } else { third };
+            let height = if fourth > y { fourth - y } else { fourth };
+            return Some((x, y, width, height));
+        }
+    }
+    let object = value.as_object()?;
+    let x = object
+        .get("x")
+        .or_else(|| object.get("left"))
+        .or_else(|| object.get("x1"))?
+        .as_f64()? as f32;
+    let y = object
+        .get("y")
+        .or_else(|| object.get("top"))
+        .or_else(|| object.get("y1"))?
+        .as_f64()? as f32;
+    let width = object
+        .get("width")
+        .and_then(Value::as_f64)
+        .map(|v| v as f32);
+    let height = object
+        .get("height")
+        .and_then(Value::as_f64)
+        .map(|v| v as f32);
+    match (width, height) {
+        (Some(width), Some(height)) => Some((x, y, width, height)),
+        _ => {
+            let right = object.get("right").or_else(|| object.get("x2"))?.as_f64()? as f32;
+            let bottom = object
+                .get("bottom")
+                .or_else(|| object.get("y2"))?
+                .as_f64()? as f32;
+            Some((x, y, right - x, bottom - y))
+        }
+    }
 }
 
 fn xml_escape(text: &str) -> String {
@@ -2533,6 +3213,10 @@ mod tests {
         pdf.extend_from_slice(b" /Type /Page ");
         assert!(estimate_page_count("manual.pdf", &pdf).unwrap() > GENERAL_DOC_MAX_PAGES);
         assert_eq!(estimate_page_count("scan.png", b"image").unwrap(), 1);
+        assert_eq!(
+            estimate_page_count("compressed.pdf", b"%PDF /Type /Pages /Count 7").unwrap(),
+            7
+        );
     }
 
     #[test]
@@ -2552,8 +3236,22 @@ mod tests {
             layout_warning: None,
             updated_at: "now".to_string(),
         }];
-        let docx = build_simple_docx("manual.pdf", &pages).unwrap();
-        let pdf = build_simple_pdf("manual.pdf", &pages);
+        let blocks = vec![GeneralDocumentBlock {
+            id: 1,
+            document_id: 1,
+            page_number: 1,
+            block_index: 0,
+            block_type: "heading".to_string(),
+            text: Some("Heading".to_string()),
+            bbox_json: Some("[50,50,200,80]".to_string()),
+            style_json: None,
+            image_path: None,
+            embedding: None,
+            created_at: "now".to_string(),
+            updated_at: "now".to_string(),
+        }];
+        let docx = build_simple_docx("manual.pdf", &pages, &blocks).unwrap();
+        let pdf = build_simple_pdf("manual.pdf", &pages, &blocks).unwrap();
         assert!(docx.starts_with(b"PK"));
         assert!(pdf.starts_with(b"%PDF"));
     }
