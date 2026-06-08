@@ -12,8 +12,13 @@
       <div id="status" class="status" title="สถานะ backend">กำลังเชื่อมต่อ…</div>
     </header>
 
+    <nav class="app-menu" aria-label="เมนูหลัก">
+      <button class="menu-tab active" type="button" data-menu-target="official">หนังสือราชการ</button>
+      <button class="menu-tab" type="button" data-menu-target="general">เอกสารทั่วไป</button>
+    </nav>
+
     <main>
-      <section class="card wide" id="documents-section">
+      <section class="card wide" id="documents-section" data-menu-view="official">
         <div class="row between">
           <h2>เอกสารที่บันทึกไว้</h2>
           <div class="btn-group">
@@ -94,7 +99,7 @@
         </section>
       </dialog>
 
-      <section class="workspace inline-detail" id="result-section" hidden>
+      <section class="workspace inline-detail" id="result-section" data-menu-view="official" hidden>
         <div class="row between">
           <h2>ผลลัพธ์</h2>
           <div class="btn-group">
@@ -123,7 +128,7 @@
         </details>
       </section>
 
-      <section class="card wide">
+      <section class="card wide menu-hidden" id="general-documents-section" data-menu-view="general">
         <div class="row between">
           <h2>เอกสารทั่วไป</h2>
           <button id="refresh-general-docs" class="ghost">รีเฟรช</button>
@@ -146,9 +151,35 @@
             </div>
           </div>
           <div id="general-action-msg" class="action-msg muted small"></div>
+          <form id="general-search-form" class="general-search">
+            <input id="general-search-query" name="query" type="search" placeholder="ค้นหาในเอกสาร" />
+            <input id="general-search-pages" name="pages" type="text" placeholder="หน้า เช่น 1-3" />
+            <select id="general-search-type" name="block_type">
+              <option value="">ทุก block</option>
+              <option value="heading">heading</option>
+              <option value="paragraph">paragraph</option>
+              <option value="table">table</option>
+              <option value="table_cell">table_cell</option>
+              <option value="image">image</option>
+              <option value="caption">caption</option>
+            </select>
+            <button id="general-search-btn" type="submit" class="ghost">ค้นหา</button>
+          </form>
+          <div id="general-search-results" class="search-results" hidden></div>
           <div class="general-layout">
             <ul id="general-page-list" class="page-list"></ul>
-            <div>
+            <div class="page-preview">
+              <div class="preview-toolbar">
+                <span id="general-preview-title" class="muted small">ตัวอย่างหน้า</span>
+                <span id="general-preview-meta" class="muted small"></span>
+              </div>
+              <div id="general-preview-canvas" class="preview-canvas">
+                <img id="general-page-image" alt="ภาพหน้าเอกสาร" hidden />
+                <div id="general-block-overlay" class="block-overlay"></div>
+                <div id="general-preview-empty" class="preview-empty muted small">ยังไม่มีภาพ preview สำหรับหน้านี้</div>
+              </div>
+            </div>
+            <div class="page-editor">
               <textarea id="general-page-text" class="json-editor" rows="14" spellcheck="false"></textarea>
               <label>คำสั่งแก้ไข
                 <textarea id="general-edit-instruction" rows="2" placeholder="เช่น ตรวจคำผิดและจัดย่อหน้าให้เรียบร้อย"></textarea>
@@ -162,7 +193,7 @@
         </section>
       </section>
 
-      <section class="card wide">
+      <section class="card wide" id="assets-section" data-menu-view="official">
         <h2>อัปโหลดต้นแบบหนังสือราชการ</h2>
         <div class="upload-grid">
           <form id="example-form" class="upload-box">

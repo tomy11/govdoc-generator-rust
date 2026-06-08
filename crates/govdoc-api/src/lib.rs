@@ -22,9 +22,9 @@ use govdoc_domain::{
     RenderRequest,
 };
 use govdoc_storage::{
-    DocumentRecord, DocumentSummary, GeneralDocumentPage, GeneralDocumentSummary,
-    NewGeneralDocument, NewMemoryRecord, NewTemplateRecord, PersistentVectorIndex, SqliteStore,
-    TemplateRecord,
+    DocumentRecord, DocumentSummary, GeneralDocumentBlock, GeneralDocumentPage,
+    GeneralDocumentSummary, NewGeneralDocument, NewGeneralDocumentBlock, NewMemoryRecord,
+    NewTemplateRecord, PersistentVectorIndex, SqliteStore, TemplateRecord,
 };
 use govdoc_usecases::{
     edit_document_json, generate_document_json, structure_document_from_text, EmbeddingProvider,
@@ -357,6 +357,18 @@ pub fn router(state: AppState) -> Router {
             "/general-documents/:id/pages/:page",
             get(get_general_document_page),
         )
+        .route(
+            "/general-documents/:id/pages/:page/blocks",
+            get(list_general_page_blocks),
+        )
+        .route(
+            "/general-documents/:id/pages/:page/image",
+            get(get_general_page_image),
+        )
+        .route(
+            "/general-documents/:id/search",
+            post(search_general_document),
+        )
         .route("/general-documents/:id/ocr", post(ocr_general_document))
         .route("/general-documents/:id/edit", post(edit_general_document))
         .route(
@@ -433,6 +445,9 @@ async fn api_index() -> Json<Value> {
             { "method": "GET",  "path": "/general-documents", "desc": "List general documents" },
             { "method": "GET",  "path": "/general-documents/:id", "desc": "Get general document metadata and page summaries" },
             { "method": "GET",  "path": "/general-documents/:id/pages/:page", "desc": "Get one OCR/edited page" },
+            { "method": "GET",  "path": "/general-documents/:id/pages/:page/blocks", "desc": "List layout/text blocks for one page" },
+            { "method": "GET",  "path": "/general-documents/:id/pages/:page/image", "desc": "Get rendered page image when available" },
+            { "method": "POST", "path": "/general-documents/:id/search", "body": "GeneralSearchRequest", "desc": "Search block-level RAG index with page/type filters" },
             { "method": "POST", "path": "/general-documents/:id/ocr", "desc": "OCR general document pages" },
             { "method": "POST", "path": "/general-documents/:id/edit", "body": "GeneralEditRequest", "desc": "Edit/check OCR text by page range" },
             { "method": "POST", "path": "/general-documents/:id/export/docx", "desc": "Export general document to DOCX" },
@@ -1162,7 +1177,38 @@ struct GeneralPageResponse {
     ocr_text: Option<String>,
     edited_text: Option<String>,
     error: Option<String>,
+    page_image_path: Option<String>,
+    page_width: Option<i64>,
+    page_height: Option<i64>,
+    layout_warning: Option<String>,
     updated_at: String,
+}
+
+#[derive(Debug, Serialize)]
+struct GeneralBlockResponse {
+    id: i64,
+    page_number: i64,
+    block_index: i64,
+    block_type: String,
+    text: Option<String>,
+    bbox: Option<Value>,
+    style: Option<Value>,
+    image_path: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GeneralSearchRequest {
+    query: String,
+    page_start: Option<i64>,
+    page_end: Option<i64>,
+    block_type: Option<String>,
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Serialize)]
+struct GeneralSearchHitResponse {
+    score: f32,
+    block: GeneralBlockResponse,
 }
 
 #[derive(Debug, Serialize)]
@@ -1204,24 +1250,55 @@ async fn upload_general_document(
         });
     }
 
-    let dir =
+    let root =
         optional_env("GOVDOC_GENERAL_DOCS_DIR").unwrap_or_else(|| GENERAL_DOCS_DIR.to_string());
-    std::fs::create_dir_all(&dir).map_err(io_error)?;
+    std::fs::create_dir_all(&root).map_err(io_error)?;
     let millis = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis())
         .unwrap_or(0);
-    let path = format!("{dir}/{millis}_{}", sanitize_filename(filename));
-    std::fs::write(&path, bytes).map_err(io_error)?;
+    let staging_dir = PathBuf::from(&root).join(format!("upload-{millis}"));
+    let source_dir = staging_dir.join("source");
+    std::fs::create_dir_all(&source_dir).map_err(io_error)?;
+    let source_path = source_dir.join(sanitize_filename(filename));
+    std::fs::write(&source_path, bytes).map_err(io_error)?;
 
     let store = lock_store(&state)?;
     let id = store
         .create_general_document(NewGeneralDocument {
             filename,
-            file_path: &path,
+            file_path: &source_path.display().to_string(),
             page_count: page_count as i64,
         })
         .map_err(internal_error)?;
+    drop(store);
+
+    let doc_dir = PathBuf::from(&root).join(id.to_string());
+    if doc_dir.exists() {
+        std::fs::remove_dir_all(&doc_dir).map_err(io_error)?;
+    }
+    std::fs::rename(&staging_dir, &doc_dir).map_err(io_error)?;
+    let final_source_path = doc_dir.join("source").join(sanitize_filename(filename));
+    {
+        let store = lock_store(&state)?;
+        store
+            .update_general_document_file_path(id, &final_source_path.display().to_string())
+            .map_err(internal_error)?;
+        let assets =
+            prepare_general_page_images(&doc_dir, filename, &final_source_path, page_count)?;
+        for asset in assets {
+            store
+                .update_general_page_asset(
+                    id,
+                    asset.page_number,
+                    asset.path.as_deref(),
+                    asset.width,
+                    asset.height,
+                    asset.warning.as_deref(),
+                )
+                .map_err(internal_error)?;
+        }
+    }
     Ok(Json(GeneralActionResponse {
         id,
         status: "pending".to_string(),
@@ -1266,6 +1343,85 @@ async fn get_general_document_page(
     Ok(Json(page.into()))
 }
 
+async fn list_general_page_blocks(
+    State(state): State<AppState>,
+    Path((id, page)): Path<(i64, i64)>,
+) -> Result<Json<Vec<GeneralBlockResponse>>, ApiError> {
+    let store = lock_store(&state)?;
+    ensure_general_document(&store, id)?;
+    let blocks = store
+        .list_general_document_blocks(id, Some(page))
+        .map_err(internal_error)?;
+    Ok(Json(blocks.into_iter().map(Into::into).collect()))
+}
+
+async fn search_general_document(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Json(req): Json<GeneralSearchRequest>,
+) -> Result<Json<Vec<GeneralSearchHitResponse>>, ApiError> {
+    let query = req.query.trim();
+    if query.is_empty() {
+        return Err(ApiError {
+            status: StatusCode::BAD_REQUEST,
+            detail: "query is required".to_string(),
+        });
+    }
+    let limit = req.limit.unwrap_or(10).clamp(1, 50);
+    let query_embedding = state.embed_for_storage(query).await?;
+    let store = lock_store(&state)?;
+    ensure_general_document(&store, id)?;
+    let blocks = store
+        .list_general_document_blocks(id, None)
+        .map_err(internal_error)?;
+    let mut hits = rank_general_blocks(
+        blocks,
+        query,
+        query_embedding.as_deref(),
+        req.page_start,
+        req.page_end,
+        req.block_type.as_deref(),
+    );
+    hits.truncate(limit);
+    Ok(Json(
+        hits.into_iter()
+            .map(|(score, block)| GeneralSearchHitResponse {
+                score,
+                block: block.into(),
+            })
+            .collect(),
+    ))
+}
+
+async fn get_general_page_image(
+    State(state): State<AppState>,
+    Path((id, page)): Path<(i64, i64)>,
+) -> Result<Response, ApiError> {
+    let page = {
+        let store = lock_store(&state)?;
+        store
+            .get_general_document_page(id, page)
+            .map_err(internal_error)?
+            .ok_or_else(|| not_found("general document page", id))?
+    };
+    let path = page.page_image_path.ok_or_else(|| ApiError {
+        status: StatusCode::NOT_FOUND,
+        detail: page
+            .layout_warning
+            .unwrap_or_else(|| "page image is not available".to_string()),
+    })?;
+    let bytes = std::fs::read(&path).map_err(io_error)?;
+    let content_type = image_content_type(&path);
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, content_type)
+        .body(Body::from(bytes))
+        .map_err(|err| ApiError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            detail: err.to_string(),
+        })
+}
+
 async fn ocr_general_document(
     State(state): State<AppState>,
     Path(id): Path<i64>,
@@ -1284,21 +1440,42 @@ async fn ocr_general_document(
         {
             let store = lock_store(&state)?;
             store
-                .update_general_page_ocr(id, page, "running", None, None)
+                .update_general_page_ocr(id, page, "running", None, None, None)
                 .map_err(internal_error)?;
         }
 
-        let result = ocr
-            .extract_text_page(&bytes, &doc.filename, Some(page as usize))
-            .await;
+        let result = match ocr
+            .extract_page(&bytes, &doc.filename, Some(page as usize))
+            .await
         {
-            let store = lock_store(&state)?;
+            Ok(output) => {
+                let mut blocks = extract_general_blocks(id, page, &output.text, &output.raw_json);
+                embed_general_blocks(&state, &mut blocks).await?;
+                Ok((output, blocks))
+            }
+            Err(err) => Err(err),
+        };
+        {
+            let mut store = lock_store(&state)?;
             match result {
-                Ok(text) => store
-                    .update_general_page_ocr(id, page, "succeeded", Some(&text), None)
-                    .map_err(internal_error)?,
+                Ok((output, blocks)) => {
+                    store
+                        .update_general_page_ocr(
+                            id,
+                            page,
+                            "succeeded",
+                            Some(&output.text),
+                            Some(&output.raw_json),
+                            None,
+                        )
+                        .map_err(internal_error)?;
+                    let records: Vec<_> = blocks.iter().map(new_general_block_record).collect();
+                    store
+                        .replace_general_page_blocks(id, page, &records)
+                        .map_err(internal_error)?;
+                }
                 Err(err) => store
-                    .update_general_page_ocr(id, page, "failed", None, Some(&err.to_string()))
+                    .update_general_page_ocr(id, page, "failed", None, None, Some(&err.to_string()))
                     .map_err(internal_error)?,
             }
         }
@@ -1326,12 +1503,17 @@ async fn edit_general_document(
             detail: "instruction is required".to_string(),
         });
     }
-    let pages = {
+    let (pages, all_blocks) = {
         let store = lock_store(&state)?;
         ensure_general_document(&store, id)?;
-        store
-            .list_general_document_pages(id)
-            .map_err(internal_error)?
+        (
+            store
+                .list_general_document_pages(id)
+                .map_err(internal_error)?,
+            store
+                .list_general_document_blocks(id, None)
+                .map_err(internal_error)?,
+        )
     };
     let target_pages: Vec<_> = if req.all_pages.unwrap_or(false) {
         pages
@@ -1349,6 +1531,15 @@ async fn edit_general_document(
         });
     }
 
+    let query_embedding = state.embed_for_storage(&req.instruction).await?;
+    let ranked_context = rank_general_blocks(
+        all_blocks,
+        &req.instruction,
+        query_embedding.as_deref(),
+        None,
+        None,
+        None,
+    );
     let editor = state.build_llm()?;
     for page in target_pages {
         let source = page
@@ -1356,7 +1547,8 @@ async fn edit_general_document(
             .as_deref()
             .or(page.ocr_text.as_deref())
             .unwrap_or("");
-        let edited = edit_general_text(editor.as_ref(), source, &req.instruction).await?;
+        let context = general_context_for_page(&ranked_context, page.page_number);
+        let edited = edit_general_text(editor.as_ref(), source, &req.instruction, &context).await?;
         let store = lock_store(&state)?;
         store
             .save_general_revision(id, page.page_number, &req.instruction, &edited)
@@ -1493,9 +1685,32 @@ impl From<GeneralDocumentPage> for GeneralPageResponse {
             ocr_text: page.ocr_text,
             edited_text: page.edited_text,
             error: page.error,
+            page_image_path: page.page_image_path,
+            page_width: page.page_width,
+            page_height: page.page_height,
+            layout_warning: page.layout_warning,
             updated_at: page.updated_at,
         }
     }
+}
+
+impl From<GeneralDocumentBlock> for GeneralBlockResponse {
+    fn from(block: GeneralDocumentBlock) -> Self {
+        Self {
+            id: block.id,
+            page_number: block.page_number,
+            block_index: block.block_index,
+            block_type: block.block_type,
+            text: block.text,
+            bbox: parse_json_opt(block.bbox_json.as_deref()),
+            style: parse_json_opt(block.style_json.as_deref()),
+            image_path: block.image_path,
+        }
+    }
+}
+
+fn parse_json_opt(raw: Option<&str>) -> Option<Value> {
+    raw.and_then(|text| serde_json::from_str(text).ok())
 }
 
 fn internal_error(err: anyhow::Error) -> ApiError {
@@ -1518,6 +1733,92 @@ fn ensure_general_document(store: &SqliteStore, id: i64) -> Result<(), ApiError>
         .map_err(internal_error)?
         .map(|_| ())
         .ok_or_else(|| not_found("general document", id))
+}
+
+fn rank_general_blocks(
+    blocks: Vec<GeneralDocumentBlock>,
+    query: &str,
+    query_embedding: Option<&[f32]>,
+    page_start: Option<i64>,
+    page_end: Option<i64>,
+    block_type: Option<&str>,
+) -> Vec<(f32, GeneralDocumentBlock)> {
+    let query_lower = query.to_lowercase();
+    let mut hits: Vec<_> = blocks
+        .into_iter()
+        .filter(|block| {
+            page_start.is_none_or(|start| block.page_number >= start)
+                && page_end.is_none_or(|end| block.page_number <= end)
+                && block_type.is_none_or(|kind| block.block_type == kind)
+        })
+        .filter_map(|block| {
+            let semantic = query_embedding
+                .zip(block.embedding.as_deref())
+                .and_then(|(query, embedding)| cosine_similarity(query, embedding));
+            let lexical = block
+                .text
+                .as_deref()
+                .map(|text| lexical_score(&query_lower, text))
+                .unwrap_or(0.0);
+            let score = semantic.unwrap_or(0.0).max(lexical);
+            (score > 0.0).then_some((score, block))
+        })
+        .collect();
+    hits.sort_by(|a, b| {
+        b.0.partial_cmp(&a.0)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.1.page_number.cmp(&b.1.page_number))
+            .then_with(|| a.1.block_index.cmp(&b.1.block_index))
+    });
+    hits
+}
+
+fn lexical_score(query_lower: &str, text: &str) -> f32 {
+    let text_lower = text.to_lowercase();
+    if text_lower.contains(query_lower) {
+        return 1.0;
+    }
+    let mut matched = 0;
+    let mut total = 0;
+    for term in query_lower.split_whitespace() {
+        total += 1;
+        if text_lower.contains(term) {
+            matched += 1;
+        }
+    }
+    if total == 0 {
+        0.0
+    } else {
+        matched as f32 / total as f32
+    }
+}
+
+fn cosine_similarity(a: &[f32], b: &[f32]) -> Option<f32> {
+    if a.len() != b.len() || a.is_empty() {
+        return None;
+    }
+    let mut dot = 0.0;
+    let mut norm_a = 0.0;
+    let mut norm_b = 0.0;
+    for (x, y) in a.iter().zip(b) {
+        dot += x * y;
+        norm_a += x * x;
+        norm_b += y * y;
+    }
+    if norm_a == 0.0 || norm_b == 0.0 {
+        None
+    } else {
+        Some(dot / (norm_a.sqrt() * norm_b.sqrt()))
+    }
+}
+
+fn image_content_type(path: &str) -> &'static str {
+    let lower = path.to_lowercase();
+    if lower.ends_with(".png") {
+        "image/png"
+    } else {
+        "image/jpeg"
+    }
 }
 
 fn validate_general_file(filename: &str, bytes: &[u8]) -> Result<(), ApiError> {
@@ -1553,13 +1854,310 @@ fn estimate_page_count(filename: &str, bytes: &[u8]) -> Result<usize, ApiError> 
     Ok(count.max(1))
 }
 
+struct PageImageAsset {
+    page_number: i64,
+    path: Option<String>,
+    width: Option<i64>,
+    height: Option<i64>,
+    warning: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct DraftGeneralBlock {
+    document_id: i64,
+    page_number: i64,
+    block_index: i64,
+    block_type: String,
+    text: Option<String>,
+    bbox_json: Option<String>,
+    style_json: Option<String>,
+    image_path: Option<String>,
+    embedding: Option<Vec<f32>>,
+}
+
+fn new_general_block_record(block: &DraftGeneralBlock) -> NewGeneralDocumentBlock<'_> {
+    NewGeneralDocumentBlock {
+        document_id: block.document_id,
+        page_number: block.page_number,
+        block_index: block.block_index,
+        block_type: &block.block_type,
+        text: block.text.as_deref(),
+        bbox_json: block.bbox_json.as_deref(),
+        style_json: block.style_json.as_deref(),
+        image_path: block.image_path.as_deref(),
+        embedding: block.embedding.as_deref(),
+    }
+}
+
+async fn embed_general_blocks(
+    state: &AppState,
+    blocks: &mut [DraftGeneralBlock],
+) -> Result<(), ApiError> {
+    for block in blocks {
+        let Some(text) = block
+            .text
+            .as_deref()
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+        else {
+            continue;
+        };
+        block.embedding = state.embed_for_storage(text).await?;
+    }
+    Ok(())
+}
+
+fn extract_general_blocks(
+    document_id: i64,
+    page_number: i64,
+    text: &str,
+    raw_json: &Value,
+) -> Vec<DraftGeneralBlock> {
+    let mut blocks = Vec::new();
+    collect_layout_blocks(raw_json, &mut blocks);
+    if blocks.is_empty() {
+        blocks = fallback_text_blocks(text);
+    }
+    blocks
+        .into_iter()
+        .enumerate()
+        .map(|(index, mut block)| {
+            block.document_id = document_id;
+            block.page_number = page_number;
+            block.block_index = index as i64;
+            block
+        })
+        .collect()
+}
+
+fn collect_layout_blocks(value: &Value, out: &mut Vec<DraftGeneralBlock>) {
+    match value {
+        Value::Array(items) => {
+            if looks_like_block_array(items) {
+                for item in items {
+                    if let Some(block) = block_from_json(item) {
+                        out.push(block);
+                    }
+                }
+            } else {
+                for item in items {
+                    collect_layout_blocks(item, out);
+                }
+            }
+        }
+        Value::Object(map) => {
+            for key in ["blocks", "layout", "elements", "cells", "lines"] {
+                if let Some(candidate) = map.get(key) {
+                    collect_layout_blocks(candidate, out);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn looks_like_block_array(items: &[Value]) -> bool {
+    items.iter().any(|item| {
+        item.get("bbox").is_some()
+            || item.get("bounding_box").is_some()
+            || item.get("block_type").is_some()
+            || item.get("type").is_some()
+    })
+}
+
+fn block_from_json(value: &Value) -> Option<DraftGeneralBlock> {
+    let text = first_string(
+        value,
+        &["text", "natural_text", "content", "markdown", "caption"],
+    );
+    let image_path =
+        first_string(value, &["image_path", "image"]).filter(|s| !s.starts_with("data:"));
+    if text.as_deref().unwrap_or("").trim().is_empty() && image_path.is_none() {
+        return None;
+    }
+    let block_type = first_string(value, &["block_type", "type", "kind"]).unwrap_or_else(|| {
+        if image_path.is_some() {
+            "image"
+        } else {
+            "paragraph"
+        }
+        .to_string()
+    });
+    let bbox_json = value
+        .get("bbox")
+        .or_else(|| value.get("bounding_box"))
+        .map(Value::to_string);
+    let style_json = value
+        .get("style")
+        .or_else(|| value.get("styles"))
+        .map(Value::to_string);
+    Some(DraftGeneralBlock {
+        document_id: 0,
+        page_number: 0,
+        block_index: 0,
+        block_type,
+        text,
+        bbox_json,
+        style_json,
+        image_path,
+        embedding: None,
+    })
+}
+
+fn first_string(value: &Value, keys: &[&str]) -> Option<String> {
+    keys.iter().find_map(|key| {
+        value
+            .get(*key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .map(ToOwned::to_owned)
+    })
+}
+
+fn fallback_text_blocks(text: &str) -> Vec<DraftGeneralBlock> {
+    text.split("\n\n")
+        .flat_map(|chunk| {
+            let trimmed = chunk.trim();
+            if trimmed.is_empty() {
+                Vec::new()
+            } else if trimmed.len() > 1200 {
+                trimmed
+                    .lines()
+                    .map(str::trim)
+                    .filter(|line| !line.is_empty())
+                    .map(ToOwned::to_owned)
+                    .collect()
+            } else {
+                vec![trimmed.to_string()]
+            }
+        })
+        .enumerate()
+        .map(|(index, text)| DraftGeneralBlock {
+            document_id: 0,
+            page_number: 0,
+            block_index: index as i64,
+            block_type: infer_block_type(&text),
+            text: Some(text),
+            bbox_json: None,
+            style_json: None,
+            image_path: None,
+            embedding: None,
+        })
+        .collect()
+}
+
+fn infer_block_type(text: &str) -> String {
+    let trimmed = text.trim();
+    if trimmed.starts_with('|') {
+        "table".to_string()
+    } else if trimmed.len() < 120 && !trimmed.contains('.') && !trimmed.contains('\n') {
+        "heading".to_string()
+    } else {
+        "paragraph".to_string()
+    }
+}
+
+fn prepare_general_page_images(
+    doc_dir: &FsPath,
+    filename: &str,
+    source_path: &FsPath,
+    page_count: usize,
+) -> Result<Vec<PageImageAsset>, ApiError> {
+    let pages_dir = doc_dir.join("pages");
+    std::fs::create_dir_all(&pages_dir).map_err(io_error)?;
+    let lower = filename.to_lowercase();
+    if !lower.ends_with(".pdf") {
+        let extension = if lower.ends_with(".png") {
+            "png"
+        } else {
+            "jpg"
+        };
+        let page_path = pages_dir.join(format!("page-001.{extension}"));
+        std::fs::copy(source_path, &page_path).map_err(io_error)?;
+        return Ok(vec![PageImageAsset {
+            page_number: 1,
+            path: Some(page_path.display().to_string()),
+            width: None,
+            height: None,
+            warning: None,
+        }]);
+    }
+
+    if command_exists("pdftoppm") {
+        let prefix = pages_dir.join("rendered-page");
+        let output = Command::new("pdftoppm")
+            .arg("-png")
+            .arg("-r")
+            .arg("150")
+            .arg("-f")
+            .arg("1")
+            .arg("-l")
+            .arg(page_count.to_string())
+            .arg(source_path)
+            .arg(&prefix)
+            .output()
+            .map_err(io_error)?;
+        if output.status.success() {
+            let mut assets = Vec::new();
+            for page in 1..=page_count {
+                let rendered = pages_dir.join(format!("rendered-page-{page}.png"));
+                let target = pages_dir.join(format!("page-{page:03}.png"));
+                if rendered.exists() {
+                    std::fs::rename(&rendered, &target).map_err(io_error)?;
+                    assets.push(PageImageAsset {
+                        page_number: page as i64,
+                        path: Some(target.display().to_string()),
+                        width: None,
+                        height: None,
+                        warning: None,
+                    });
+                } else {
+                    assets.push(PageImageAsset {
+                        page_number: page as i64,
+                        path: None,
+                        width: None,
+                        height: None,
+                        warning: Some(
+                            "PDF page image render did not produce this page".to_string(),
+                        ),
+                    });
+                }
+            }
+            return Ok(assets);
+        }
+    }
+
+    Ok((1..=page_count)
+        .map(|page| PageImageAsset {
+            page_number: page as i64,
+            path: None,
+            width: None,
+            height: None,
+            warning: Some(
+                "PDF page image rendering requires pdftoppm; using text fallback".to_string(),
+            ),
+        })
+        .collect())
+}
+
+fn command_exists(name: &str) -> bool {
+    Command::new("which")
+        .arg(name)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
 async fn edit_general_text(
     editor: &dyn LlmProvider,
     text: &str,
     instruction: &str,
+    rag_context: &str,
 ) -> Result<String, ApiError> {
     let prompt = format!(
-        "คำสั่ง: {instruction}\n\nข้อความต้นฉบับ:\n{text}\n\nส่งกลับเฉพาะข้อความที่แก้แล้ว รักษาโครงย่อหน้า หัวข้อ ตาราง markdown และลำดับบรรทัดเดิมให้มากที่สุด"
+        "คำสั่ง: {instruction}\n\nบริบทจาก block-level RAG (ใช้เพื่อเข้าใจตำแหน่ง/ตาราง/ย่อหน้า ห้ามคัด metadata ลงผลลัพธ์):\n{rag_context}\n\nข้อความต้นฉบับของหน้าที่ต้องแก้:\n{text}\n\nส่งกลับเฉพาะข้อความที่แก้แล้ว รักษาโครงย่อหน้า หัวข้อ ตาราง markdown และลำดับบรรทัดเดิมให้มากที่สุด"
     );
     editor
         .complete(
@@ -1572,6 +2170,33 @@ async fn edit_general_text(
             status: StatusCode::BAD_GATEWAY,
             detail: format!("general document edit failed: {err}"),
         })
+}
+
+fn general_context_for_page(hits: &[(f32, GeneralDocumentBlock)], page_number: i64) -> String {
+    let mut lines = Vec::new();
+    for (score, block) in hits
+        .iter()
+        .filter(|(_, block)| block.page_number == page_number)
+        .take(8)
+    {
+        let snippet = block
+            .text
+            .as_deref()
+            .unwrap_or("")
+            .chars()
+            .take(500)
+            .collect::<String>();
+        let bbox = block.bbox_json.as_deref().unwrap_or("-");
+        lines.push(format!(
+            "page={} block={} type={} score={score:.3} bbox={} text={}",
+            block.page_number, block.block_index, block.block_type, bbox, snippet
+        ));
+    }
+    if lines.is_empty() {
+        "(ไม่มี block context ที่ match โดยตรง ใช้ข้อความหน้าปัจจุบันเป็นหลัก)".to_string()
+    } else {
+        lines.join("\n")
+    }
 }
 
 fn general_export_payload(
@@ -1920,6 +2545,11 @@ mod tests {
             ocr_text: Some("Heading\nBody text".to_string()),
             edited_text: None,
             error: None,
+            page_image_path: None,
+            ocr_raw_json: None,
+            page_width: None,
+            page_height: None,
+            layout_warning: None,
             updated_at: "now".to_string(),
         }];
         let docx = build_simple_docx("manual.pdf", &pages).unwrap();
@@ -2270,8 +2900,10 @@ mod tests {
 
     #[tokio::test]
     async fn render_requires_configured_sidecar() {
-        let mut state = AppState::default();
-        state.renderer_cmd = None;
+        let state = AppState {
+            renderer_cmd: None,
+            ..AppState::default()
+        };
         let app = router(state);
         let response = app
             .oneshot(

@@ -7,6 +7,33 @@ let expandedDocumentId = null;
 const resultPanel = document.getElementById("result-section");
 let currentGeneralDoc = null;
 let currentGeneralPage = 1;
+const generalBlocksByPage = new Map();
+let selectedGeneralBlock = null;
+
+function switchMenu(target) {
+  document.querySelectorAll("[data-menu-view]").forEach((section) => {
+    section.classList.toggle("menu-hidden", section.dataset.menuView !== target);
+  });
+  document.querySelectorAll("[data-menu-target]").forEach((button) => {
+    button.classList.toggle("active", button.dataset.menuTarget === target);
+  });
+  if (target === "general") {
+    loadGeneralDocuments();
+  } else {
+    loadDocuments();
+  }
+}
+
+document.querySelectorAll("[data-menu-target]").forEach((button) => {
+  button.addEventListener("click", () => switchMenu(button.dataset.menuTarget));
+});
+
+window.addEventListener("resize", () => {
+  if (!currentGeneralDoc) return;
+  const page = currentGeneralDoc.pages.find((p) => p.page_number === currentGeneralPage);
+  const blocks = generalBlocksByPage.get(currentGeneralPage) || [];
+  renderGeneralBlockOverlay(page, blocks, selectedGeneralBlock);
+});
 
 async function loadStatus() {
   const el = document.getElementById("status");
@@ -478,8 +505,12 @@ async function openGeneralDocument(id) {
   const doc = await (await fetch(`${API}/general-documents/${id}`)).json();
   currentGeneralDoc = doc;
   currentGeneralPage = doc.pages[0]?.page_number || 1;
+  generalBlocksByPage.clear();
+  selectedGeneralBlock = null;
   document.getElementById("general-doc-detail").hidden = false;
   document.getElementById("general-detail-title").textContent = `${doc.filename} (${doc.page_count} หน้า)`;
+  document.getElementById("general-search-results").hidden = true;
+  document.getElementById("general-search-results").replaceChildren();
   renderGeneralPageList();
   showGeneralPage(currentGeneralPage);
 }
@@ -493,6 +524,7 @@ function renderGeneralPageList() {
       li.className = p.page_number === currentGeneralPage ? "selected" : "";
       li.addEventListener("click", () => {
         currentGeneralPage = p.page_number;
+        selectedGeneralBlock = null;
         renderGeneralPageList();
         showGeneralPage(currentGeneralPage);
       });
@@ -501,11 +533,217 @@ function renderGeneralPageList() {
   );
 }
 
-function showGeneralPage(pageNumber) {
+async function showGeneralPage(pageNumber, selectedBlock = null) {
   const page = currentGeneralDoc.pages.find((p) => p.page_number === pageNumber);
+  if (selectedBlock) selectedGeneralBlock = selectedBlock;
   document.getElementById("general-page-text").value =
     page?.edited_text || page?.ocr_text || page?.error || "ยังไม่มีข้อความ OCR";
+  const msg = document.getElementById("general-action-msg");
+  if (page?.layout_warning) {
+    msg.className = "action-msg muted small";
+    msg.textContent = page.layout_warning;
+  }
+  renderGeneralPreviewShell(page);
+  const blocks = await loadGeneralPageBlocks(pageNumber);
+  renderGeneralBlockOverlay(page, blocks, selectedGeneralBlock);
 }
+
+async function loadGeneralPageBlocks(pageNumber) {
+  if (!currentGeneralDoc) return [];
+  if (generalBlocksByPage.has(pageNumber)) return generalBlocksByPage.get(pageNumber);
+  try {
+    const res = await fetch(`${API}/general-documents/${currentGeneralDoc.id}/pages/${pageNumber}/blocks`);
+    if (!res.ok) throw new Error(String(res.status));
+    const blocks = await res.json();
+    generalBlocksByPage.set(pageNumber, blocks);
+    return blocks;
+  } catch {
+    generalBlocksByPage.set(pageNumber, []);
+    return [];
+  }
+}
+
+function renderGeneralPreviewShell(page) {
+  const title = document.getElementById("general-preview-title");
+  const meta = document.getElementById("general-preview-meta");
+  const img = document.getElementById("general-page-image");
+  const empty = document.getElementById("general-preview-empty");
+  const overlay = document.getElementById("general-block-overlay");
+  overlay.replaceChildren();
+  overlay.style.width = "";
+  overlay.style.height = "";
+  title.textContent = page ? `หน้า ${page.page_number}` : "ตัวอย่างหน้า";
+  meta.textContent = page?.page_width && page?.page_height ? `${page.page_width}×${page.page_height}` : "";
+  if (!page?.page_image_path) {
+    img.hidden = true;
+    img.removeAttribute("src");
+    empty.hidden = false;
+    return;
+  }
+  empty.hidden = true;
+  img.hidden = false;
+  img.src = `${API}/general-documents/${currentGeneralDoc.id}/pages/${page.page_number}/image?v=${encodeURIComponent(page.updated_at || "")}`;
+  img.onload = () => {
+    const blocks = generalBlocksByPage.get(page.page_number) || [];
+    renderGeneralBlockOverlay(page, blocks, selectedGeneralBlock);
+  };
+  img.onerror = () => {
+    img.hidden = true;
+    empty.hidden = false;
+  };
+}
+
+function renderGeneralBlockOverlay(page, blocks, selectedBlock) {
+  const overlay = document.getElementById("general-block-overlay");
+  const img = document.getElementById("general-page-image");
+  overlay.replaceChildren();
+  if (!page || img.hidden || !img.complete || !img.naturalWidth) return;
+  overlay.style.width = `${img.clientWidth}px`;
+  overlay.style.height = `${img.clientHeight}px`;
+  const pageWidth = page.page_width || img.naturalWidth;
+  const pageHeight = page.page_height || img.naturalHeight;
+  for (const block of blocks) {
+    const box = normalizeBbox(block.bbox, pageWidth, pageHeight);
+    if (!box) continue;
+    const el = document.createElement("div");
+    el.className = "block-box";
+    if (selectedBlock && block.block_index === selectedBlock.block_index && block.page_number === selectedBlock.page_number) {
+      el.classList.add("active");
+    }
+    el.style.left = `${box.left}%`;
+    el.style.top = `${box.top}%`;
+    el.style.width = `${box.width}%`;
+    el.style.height = `${box.height}%`;
+    el.title = `${block.block_type} #${block.block_index}`;
+    overlay.appendChild(el);
+  }
+}
+
+function normalizeBbox(bbox, pageWidth, pageHeight) {
+  if (!bbox || !pageWidth || !pageHeight) return null;
+  let x;
+  let y;
+  let width;
+  let height;
+  if (Array.isArray(bbox) && bbox.length >= 4) {
+    x = Number(bbox[0]);
+    y = Number(bbox[1]);
+    const third = Number(bbox[2]);
+    const fourth = Number(bbox[3]);
+    width = third > x ? third - x : third;
+    height = fourth > y ? fourth - y : fourth;
+  } else if (typeof bbox === "object") {
+    x = Number(bbox.x ?? bbox.left ?? bbox.x1 ?? 0);
+    y = Number(bbox.y ?? bbox.top ?? bbox.y1 ?? 0);
+    if (bbox.width != null || bbox.height != null) {
+      width = Number(bbox.width ?? 0);
+      height = Number(bbox.height ?? 0);
+    } else {
+      const right = Number(bbox.right ?? bbox.x2 ?? 0);
+      const bottom = Number(bbox.bottom ?? bbox.y2 ?? 0);
+      width = right - x;
+      height = bottom - y;
+    }
+  }
+  if (![x, y, width, height].every(Number.isFinite) || width <= 0 || height <= 0) return null;
+  return {
+    left: clampPercent((x / pageWidth) * 100),
+    top: clampPercent((y / pageHeight) * 100),
+    width: clampPercent((width / pageWidth) * 100),
+    height: clampPercent((height / pageHeight) * 100),
+  };
+}
+
+function clampPercent(value) {
+  return Math.max(0, Math.min(100, value));
+}
+
+function parseGeneralPageRange(raw) {
+  const value = raw.trim();
+  if (!value) return {};
+  const match = value.match(/^(\d+)(?:\s*-\s*(\d+))?$/);
+  if (!match) throw new Error("รูปแบบหน้าต้องเป็นเลขหน้า เช่น 2 หรือ 1-3");
+  const start = Number(match[1]);
+  const end = Number(match[2] || match[1]);
+  if (end < start) throw new Error("ช่วงหน้าต้องเรียงจากน้อยไปมาก");
+  return { page_start: start, page_end: end };
+}
+
+function renderGeneralSearchResults(hits) {
+  const box = document.getElementById("general-search-results");
+  if (!hits.length) {
+    box.hidden = false;
+    box.textContent = "ไม่พบ block ที่ตรงกับคำค้น";
+    return;
+  }
+  box.hidden = false;
+  box.replaceChildren(
+    ...hits.map((hit) => {
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "search-hit";
+      const meta = document.createElement("div");
+      meta.className = "meta";
+      meta.textContent = `หน้า ${hit.block.page_number} · ${hit.block.block_type} · ${hit.score.toFixed(2)}`;
+      const snippet = document.createElement("div");
+      snippet.className = "snippet";
+      snippet.textContent = (hit.block.text || hit.block.image_path || "").slice(0, 220);
+      btn.append(meta, snippet);
+      btn.addEventListener("click", () => {
+        currentGeneralPage = hit.block.page_number;
+        selectedGeneralBlock = hit.block;
+        renderGeneralPageList();
+        showGeneralPage(currentGeneralPage, hit.block);
+        document.getElementById("general-action-msg").className = "action-msg ok small";
+        document.getElementById("general-action-msg").textContent =
+          `เลือก block #${hit.block.block_index} (${hit.block.block_type})`;
+      });
+      return btn;
+    }),
+  );
+}
+
+document.getElementById("general-search-form").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  if (!currentGeneralDoc) return;
+  const msg = document.getElementById("general-action-msg");
+  const query = document.getElementById("general-search-query").value.trim();
+  if (!query) {
+    msg.className = "action-msg err small";
+    msg.textContent = "❌ กรุณาใส่คำค้นหา";
+    return;
+  }
+  let pageRange;
+  try {
+    pageRange = parseGeneralPageRange(document.getElementById("general-search-pages").value);
+  } catch (err) {
+    msg.className = "action-msg err small";
+    msg.textContent = `❌ ${err.message}`;
+    return;
+  }
+  msg.className = "action-msg muted small";
+  msg.textContent = "กำลังค้นหา block…";
+  const blockType = document.getElementById("general-search-type").value;
+  const res = await fetch(`${API}/general-documents/${currentGeneralDoc.id}/search`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      query,
+      ...pageRange,
+      block_type: blockType || null,
+      limit: 12,
+    }),
+  });
+  const data = await res.json().catch(() => []);
+  if (!res.ok) {
+    msg.className = "action-msg err small";
+    msg.textContent = `❌ ${data.detail || res.status}`;
+    return;
+  }
+  msg.className = "action-msg ok small";
+  msg.textContent = `✓ พบ ${data.length} block`;
+  renderGeneralSearchResults(data);
+});
 
 async function runGeneralOcr(id = currentGeneralDoc?.id) {
   if (!id) return;
@@ -614,6 +852,5 @@ wireUpload("example-form", "/ingest/ocr/upload", (d) => {
 wireUpload("template-form", "/templates/upload", (d) => `✓ บันทึกแม่แบบ #${d.id} (${d.name})`);
 
 loadStatus();
-loadDocuments();
-loadGeneralDocuments();
+switchMenu("official");
 setInterval(loadStatus, 10000);

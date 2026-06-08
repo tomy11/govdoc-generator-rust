@@ -63,6 +63,18 @@ pub struct NewGeneralDocument<'a> {
     pub page_count: i64,
 }
 
+pub struct NewGeneralDocumentBlock<'a> {
+    pub document_id: i64,
+    pub page_number: i64,
+    pub block_index: i64,
+    pub block_type: &'a str,
+    pub text: Option<&'a str>,
+    pub bbox_json: Option<&'a str>,
+    pub style_json: Option<&'a str>,
+    pub image_path: Option<&'a str>,
+    pub embedding: Option<&'a [f32]>,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct GeneralDocumentSummary {
     pub id: i64,
@@ -83,6 +95,27 @@ pub struct GeneralDocumentPage {
     pub ocr_text: Option<String>,
     pub edited_text: Option<String>,
     pub error: Option<String>,
+    pub page_image_path: Option<String>,
+    pub ocr_raw_json: Option<String>,
+    pub page_width: Option<i64>,
+    pub page_height: Option<i64>,
+    pub layout_warning: Option<String>,
+    pub updated_at: String,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct GeneralDocumentBlock {
+    pub id: i64,
+    pub document_id: i64,
+    pub page_number: i64,
+    pub block_index: i64,
+    pub block_type: String,
+    pub text: Option<String>,
+    pub bbox_json: Option<String>,
+    pub style_json: Option<String>,
+    pub image_path: Option<String>,
+    pub embedding: Option<Vec<f32>>,
+    pub created_at: String,
     pub updated_at: String,
 }
 
@@ -154,8 +187,30 @@ impl SqliteStore {
                 ocr_text TEXT,
                 edited_text TEXT,
                 error TEXT,
+                page_image_path TEXT,
+                ocr_raw_json TEXT,
+                page_width INTEGER,
+                page_height INTEGER,
+                layout_warning TEXT,
                 updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 UNIQUE(document_id, page_number),
+                FOREIGN KEY(document_id) REFERENCES general_document(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS general_document_block (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                document_id INTEGER NOT NULL,
+                page_number INTEGER NOT NULL,
+                block_index INTEGER NOT NULL,
+                block_type TEXT NOT NULL,
+                text TEXT,
+                bbox_json TEXT,
+                style_json TEXT,
+                image_path TEXT,
+                embedding TEXT,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(document_id, page_number, block_index),
                 FOREIGN KEY(document_id) REFERENCES general_document(id) ON DELETE CASCADE
             );
 
@@ -175,6 +230,26 @@ impl SqliteStore {
         let _ = self
             .conn
             .execute("ALTER TABLE gov_doc_memory ADD COLUMN embedding TEXT", []);
+        let _ = self.conn.execute(
+            "ALTER TABLE general_document_page ADD COLUMN page_image_path TEXT",
+            [],
+        );
+        let _ = self.conn.execute(
+            "ALTER TABLE general_document_page ADD COLUMN ocr_raw_json TEXT",
+            [],
+        );
+        let _ = self.conn.execute(
+            "ALTER TABLE general_document_page ADD COLUMN page_width INTEGER",
+            [],
+        );
+        let _ = self.conn.execute(
+            "ALTER TABLE general_document_page ADD COLUMN page_height INTEGER",
+            [],
+        );
+        let _ = self.conn.execute(
+            "ALTER TABLE general_document_page ADD COLUMN layout_warning TEXT",
+            [],
+        );
         Ok(())
     }
 
@@ -561,12 +636,20 @@ impl SqliteStore {
             .map_err(Into::into)
     }
 
+    pub fn update_general_document_file_path(&self, id: i64, file_path: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE general_document SET file_path = ?1, updated_at = CURRENT_TIMESTAMP WHERE id = ?2",
+            params![file_path, id],
+        )?;
+        Ok(())
+    }
+
     pub fn list_general_document_pages(
         &self,
         document_id: i64,
     ) -> Result<Vec<GeneralDocumentPage>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, document_id, page_number, status, ocr_text, edited_text, error, updated_at FROM general_document_page WHERE document_id = ?1 ORDER BY page_number",
+            "SELECT id, document_id, page_number, status, ocr_text, edited_text, error, page_image_path, ocr_raw_json, page_width, page_height, layout_warning, updated_at FROM general_document_page WHERE document_id = ?1 ORDER BY page_number",
         )?;
         let rows = stmt.query_map(params![document_id], general_page_from_row)?;
         rows.collect::<rusqlite::Result<_>>().map_err(Into::into)
@@ -579,12 +662,35 @@ impl SqliteStore {
     ) -> Result<Option<GeneralDocumentPage>> {
         self.conn
             .query_row(
-                "SELECT id, document_id, page_number, status, ocr_text, edited_text, error, updated_at FROM general_document_page WHERE document_id = ?1 AND page_number = ?2",
+                "SELECT id, document_id, page_number, status, ocr_text, edited_text, error, page_image_path, ocr_raw_json, page_width, page_height, layout_warning, updated_at FROM general_document_page WHERE document_id = ?1 AND page_number = ?2",
                 params![document_id, page_number],
                 general_page_from_row,
             )
             .optional()
             .map_err(Into::into)
+    }
+
+    pub fn update_general_page_asset(
+        &self,
+        document_id: i64,
+        page_number: i64,
+        page_image_path: Option<&str>,
+        page_width: Option<i64>,
+        page_height: Option<i64>,
+        layout_warning: Option<&str>,
+    ) -> Result<()> {
+        self.conn.execute(
+            "UPDATE general_document_page SET page_image_path = ?1, page_width = ?2, page_height = ?3, layout_warning = ?4, updated_at = CURRENT_TIMESTAMP WHERE document_id = ?5 AND page_number = ?6",
+            params![
+                page_image_path,
+                page_width,
+                page_height,
+                layout_warning,
+                document_id,
+                page_number
+            ],
+        )?;
+        Ok(())
     }
 
     pub fn update_general_page_ocr(
@@ -593,14 +699,84 @@ impl SqliteStore {
         page_number: i64,
         status: &str,
         text: Option<&str>,
+        raw_json: Option<&Value>,
         error: Option<&str>,
     ) -> Result<()> {
+        let raw_json = raw_json.map(serde_json::to_string).transpose()?;
         self.conn.execute(
-            "UPDATE general_document_page SET status = ?1, ocr_text = ?2, error = ?3, updated_at = CURRENT_TIMESTAMP WHERE document_id = ?4 AND page_number = ?5",
-            params![status, text, error, document_id, page_number],
+            "UPDATE general_document_page SET status = ?1, ocr_text = ?2, ocr_raw_json = ?3, error = ?4, updated_at = CURRENT_TIMESTAMP WHERE document_id = ?5 AND page_number = ?6",
+            params![status, text, raw_json, error, document_id, page_number],
         )?;
         self.update_general_document_status(document_id)?;
         Ok(())
+    }
+
+    pub fn replace_general_page_blocks(
+        &mut self,
+        document_id: i64,
+        page_number: i64,
+        blocks: &[NewGeneralDocumentBlock<'_>],
+    ) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "DELETE FROM general_document_block WHERE document_id = ?1 AND page_number = ?2",
+            params![document_id, page_number],
+        )?;
+        for block in blocks {
+            let embedding_json = block.embedding.map(serde_json::to_string).transpose()?;
+            tx.execute(
+                r#"
+                INSERT INTO general_document_block (
+                    document_id, page_number, block_index, block_type, text,
+                    bbox_json, style_json, image_path, embedding
+                )
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                "#,
+                params![
+                    block.document_id,
+                    block.page_number,
+                    block.block_index,
+                    block.block_type,
+                    block.text,
+                    block.bbox_json,
+                    block.style_json,
+                    block.image_path,
+                    embedding_json,
+                ],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn list_general_document_blocks(
+        &self,
+        document_id: i64,
+        page_number: Option<i64>,
+    ) -> Result<Vec<GeneralDocumentBlock>> {
+        let mut blocks = Vec::new();
+        match page_number {
+            Some(page_number) => {
+                let mut stmt = self.conn.prepare(
+                    "SELECT id, document_id, page_number, block_index, block_type, text, bbox_json, style_json, image_path, embedding, created_at, updated_at FROM general_document_block WHERE document_id = ?1 AND page_number = ?2 ORDER BY page_number, block_index",
+                )?;
+                let rows =
+                    stmt.query_map(params![document_id, page_number], general_block_from_row)?;
+                for row in rows {
+                    blocks.push(row?);
+                }
+            }
+            None => {
+                let mut stmt = self.conn.prepare(
+                    "SELECT id, document_id, page_number, block_index, block_type, text, bbox_json, style_json, image_path, embedding, created_at, updated_at FROM general_document_block WHERE document_id = ?1 ORDER BY page_number, block_index",
+                )?;
+                let rows = stmt.query_map(params![document_id], general_block_from_row)?;
+                for row in rows {
+                    blocks.push(row?);
+                }
+            }
+        }
+        Ok(blocks)
     }
 
     pub fn save_general_revision(
@@ -687,7 +863,33 @@ fn general_page_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<GeneralDoc
         ocr_text: row.get(4)?,
         edited_text: row.get(5)?,
         error: row.get(6)?,
-        updated_at: row.get(7)?,
+        page_image_path: row.get(7)?,
+        ocr_raw_json: row.get(8)?,
+        page_width: row.get(9)?,
+        page_height: row.get(10)?,
+        layout_warning: row.get(11)?,
+        updated_at: row.get(12)?,
+    })
+}
+
+fn general_block_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<GeneralDocumentBlock> {
+    let embedding_json: Option<String> = row.get(9)?;
+    let embedding = embedding_json
+        .as_deref()
+        .and_then(|json| serde_json::from_str::<Vec<f32>>(json).ok());
+    Ok(GeneralDocumentBlock {
+        id: row.get(0)?,
+        document_id: row.get(1)?,
+        page_number: row.get(2)?,
+        block_index: row.get(3)?,
+        block_type: row.get(4)?,
+        text: row.get(5)?,
+        bbox_json: row.get(6)?,
+        style_json: row.get(7)?,
+        image_path: row.get(8)?,
+        embedding,
+        created_at: row.get(10)?,
+        updated_at: row.get(11)?,
     })
 }
 
@@ -877,7 +1079,7 @@ mod tests {
 
     #[test]
     fn stores_general_documents_pages_and_revisions() {
-        let store = SqliteStore::open_memory().unwrap();
+        let mut store = SqliteStore::open_memory().unwrap();
         let id = store
             .create_general_document(NewGeneralDocument {
                 filename: "manual.pdf",
@@ -895,8 +1097,30 @@ mod tests {
         assert_eq!(pages[0].status, "pending");
 
         store
-            .update_general_page_ocr(id, 1, "succeeded", Some("ข้อความหน้า 1"), None)
+            .update_general_page_ocr(id, 1, "succeeded", Some("ข้อความหน้า 1"), None, None)
             .unwrap();
+        store
+            .update_general_page_asset(
+                id,
+                1,
+                Some("app-data/general-documents/1/pages/page-001.png"),
+                Some(1000),
+                Some(1400),
+                None,
+            )
+            .unwrap();
+        let block = NewGeneralDocumentBlock {
+            document_id: id,
+            page_number: 1,
+            block_index: 0,
+            block_type: "paragraph",
+            text: Some("ข้อความหน้า 1"),
+            bbox_json: Some("[0,0,100,20]"),
+            style_json: None,
+            image_path: None,
+            embedding: Some(&[0.1, 0.2, 0.3]),
+        };
+        store.replace_general_page_blocks(id, 1, &[block]).unwrap();
         store
             .save_general_revision(id, 1, "ตรวจคำผิด", "ข้อความหน้า 1 แก้แล้ว")
             .unwrap();
@@ -904,6 +1128,11 @@ mod tests {
         let page = store.get_general_document_page(id, 1).unwrap().unwrap();
         assert_eq!(page.ocr_text.as_deref(), Some("ข้อความหน้า 1"));
         assert_eq!(page.edited_text.as_deref(), Some("ข้อความหน้า 1 แก้แล้ว"));
+        assert_eq!(page.page_width, Some(1000));
+        let blocks = store.list_general_document_blocks(id, Some(1)).unwrap();
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].block_type, "paragraph");
+        assert_eq!(blocks[0].embedding.as_deref(), Some(&[0.1, 0.2, 0.3][..]));
         assert_eq!(
             store.get_general_document(id).unwrap().unwrap().status,
             "running"

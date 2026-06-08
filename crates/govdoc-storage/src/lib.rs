@@ -4,7 +4,8 @@ pub mod vector_index;
 
 pub use hnsw::{HnswIndex, InMemoryVectorIndex, VectorHit};
 pub use sqlite::{
-    DocumentRecord, DocumentSummary, GeneralDocumentPage, GeneralDocumentSummary,
-    NewGeneralDocument, NewMemoryRecord, NewTemplateRecord, SqliteStore, TemplateRecord,
+    DocumentRecord, DocumentSummary, GeneralDocumentBlock, GeneralDocumentPage,
+    GeneralDocumentSummary, NewGeneralDocument, NewGeneralDocumentBlock, NewMemoryRecord,
+    NewTemplateRecord, SqliteStore, TemplateRecord,
 };
 pub use vector_index::PersistentVectorIndex;

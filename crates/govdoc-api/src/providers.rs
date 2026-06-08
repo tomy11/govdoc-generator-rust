@@ -280,6 +280,12 @@ pub struct TyphoonOcrProvider {
     config: OcrConfig,
 }
 
+#[derive(Clone, Debug)]
+pub struct OcrPageOutput {
+    pub text: String,
+    pub raw_json: Value,
+}
+
 impl TyphoonOcrProvider {
     pub fn new(config: OcrConfig) -> anyhow::Result<Self> {
         let client = reqwest::Client::builder()
@@ -301,6 +307,17 @@ impl TyphoonOcrProvider {
         filename: &str,
         page_num: Option<usize>,
     ) -> anyhow::Result<String> {
+        self.extract_page(file, filename, page_num)
+            .await
+            .map(|output| output.text)
+    }
+
+    pub async fn extract_page(
+        &self,
+        file: &[u8],
+        filename: &str,
+        page_num: Option<usize>,
+    ) -> anyhow::Result<OcrPageOutput> {
         let key = self
             .config
             .api_key
@@ -342,7 +359,11 @@ impl TyphoonOcrProvider {
 
         let parsed: Value =
             serde_json::from_str(&payload).context("OCR response was not valid JSON")?;
-        parse_ocr_response(&parsed)
+        let text = parse_ocr_response(&parsed)?;
+        Ok(OcrPageOutput {
+            text,
+            raw_json: parsed,
+        })
     }
 }
 
