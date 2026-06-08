@@ -96,6 +96,13 @@ dialog::backdrop {
   overflow: auto;
   box-shadow: 0 22px 80px rgba(31, 41, 51, 0.22);
 }
+.confirm-dialog { width: min(420px, calc(100vw - 28px)); }
+.confirm-message { margin: 4px 0 20px; font-size: 0.95rem; line-height: 1.5; }
+.confirm-actions .del {
+  background: transparent;
+  color: var(--bad);
+  border: 1px solid var(--line);
+}
 
 form label {
   display: block;

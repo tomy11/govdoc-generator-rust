@@ -79,9 +79,18 @@ async function loadGeneralDocuments() {
 }
 
 async function deleteGeneralDocument(id, filename) {
-  if (!window.confirm(`ลบเอกสารทั่วไป "${filename}" พร้อมไฟล์ทั้งหมด?`)) return;
-  let res = await fetch(`${API}/general-documents/${id}`, { method: "DELETE" });
-  if (!res.ok && [404, 405, 501].includes(res.status)) {
+  if (!(await confirmDialog(`ลบเอกสารทั่วไป "${filename}" พร้อมไฟล์ทั้งหมด?`))) return;
+  let res = null;
+  try {
+    res = await fetch(`${API}/general-documents/${id}`, { method: "DELETE" });
+    // Route missing / method not allowed → use the POST fallback below.
+    if (!res.ok && [404, 405, 501].includes(res.status)) res = null;
+  } catch {
+    // DELETE can be blocked by a webview CORS preflight (e.g. WKWebView);
+    // fall through to the POST endpoint, which is a no-preflight simple request.
+    res = null;
+  }
+  if (!res) {
     res = await fetch(`${API}/general-documents/${id}/delete`, { method: "POST" });
   }
   if (!res.ok) {
@@ -380,3 +389,6 @@ document.getElementById("general-edit-block-btn").addEventListener("click", () =
 document.getElementById("general-edit-all-btn").addEventListener("click", () => editGeneralDocument("all"));
 document.getElementById("general-export-docx-btn").addEventListener("click", () => exportGeneralDocument("docx"));
 document.getElementById("general-export-pdf-btn").addEventListener("click", () => exportGeneralDocument("pdf"));
+document
+  .getElementById("general-export-searchable-btn")
+  .addEventListener("click", () => exportGeneralDocument("searchable-pdf"));

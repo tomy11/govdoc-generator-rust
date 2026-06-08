@@ -123,15 +123,23 @@ impl SqliteStore {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let conn = Connection::open(path)?;
         let store = Self { conn };
-        store.migrate()?;
+        store.init()?;
         Ok(store)
     }
 
     pub fn open_memory() -> Result<Self> {
         let conn = Connection::open_in_memory()?;
         let store = Self { conn };
-        store.migrate()?;
+        store.init()?;
         Ok(store)
+    }
+
+    fn init(&self) -> Result<()> {
+        // SQLite disables foreign keys per-connection by default, so the
+        // ON DELETE CASCADE on general_document child tables would never fire
+        // and deleting a document would leave orphaned page/block/revision rows.
+        self.conn.execute_batch("PRAGMA foreign_keys = ON;")?;
+        self.migrate()
     }
 
     pub fn migrate(&self) -> Result<()> {
@@ -1172,6 +1180,22 @@ mod tests {
             store.get_general_document(id).unwrap().unwrap().status,
             "running"
         );
+
+        // Deleting the document must cascade to its pages, blocks and
+        // revisions — this only holds with `PRAGMA foreign_keys = ON`.
+        assert!(store.delete_general_document(id).unwrap());
+        assert!(store.get_general_document(id).unwrap().is_none());
+        assert!(store.list_general_document_pages(id).unwrap().is_empty());
+        assert!(store.list_general_document_blocks(id, None).unwrap().is_empty());
+        let revisions: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM general_document_revision WHERE document_id = ?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(revisions, 0);
     }
 
     #[test]

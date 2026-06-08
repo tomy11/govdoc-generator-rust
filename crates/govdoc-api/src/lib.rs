@@ -12,7 +12,7 @@ use anyhow::Context;
 use axum::{
     body::Body,
     extract::{DefaultBodyLimit, Multipart, Path, Query, State},
-    http::{header, StatusCode},
+    http::{header, Method, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
@@ -32,7 +32,7 @@ use govdoc_usecases::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tower_http::cors::CorsLayer;
+use tower_http::cors::{Any, CorsLayer};
 
 use crate::memory::SqliteMemoryRepository;
 use crate::mock::{FakeEmbeddingProvider, FakeLlmProvider};
@@ -386,11 +386,30 @@ pub fn router(state: AppState) -> Router {
             "/general-documents/:id/export/pdf",
             post(export_general_pdf),
         )
+        .route(
+            "/general-documents/:id/export/searchable-pdf",
+            post(export_general_searchable_pdf),
+        )
         // Allow up to 25 MB uploads (scanned PDFs, .docx templates).
         .layer(DefaultBodyLimit::max(25 * 1024 * 1024))
-        // Permissive CORS: the API binds to localhost only and is consumed by
-        // the Tauri webview / local tools, so any local origin is acceptable.
-        .layer(CorsLayer::permissive())
+        // CORS: the API binds to localhost only and is consumed by the Tauri
+        // webview / local tools, so any origin is acceptable. We enumerate the
+        // methods explicitly rather than using CorsLayer::permissive() because
+        // the macOS Tauri webview (WKWebView/Safari) does not honour the `*`
+        // wildcard in Access-Control-Allow-Methods, which made preflighted
+        // requests (DELETE, PUT, JSON POST) fail silently.
+        .layer(
+            CorsLayer::new()
+                .allow_origin(Any)
+                .allow_headers(Any)
+                .allow_methods([
+                    Method::GET,
+                    Method::POST,
+                    Method::PUT,
+                    Method::DELETE,
+                    Method::OPTIONS,
+                ]),
+        )
         .with_state(state)
 }
 
@@ -460,6 +479,7 @@ async fn api_index() -> Json<Value> {
             { "method": "POST", "path": "/general-documents/:id/edit", "body": "GeneralEditRequest", "desc": "Edit/check OCR text by page range" },
             { "method": "POST", "path": "/general-documents/:id/export/docx", "desc": "Export general document to DOCX" },
             { "method": "POST", "path": "/general-documents/:id/export/pdf", "desc": "Export general document to PDF" },
+            { "method": "POST", "path": "/general-documents/:id/export/searchable-pdf", "desc": "Export original PDF as searchable (vector passthrough + OCR fallback)" },
             { "method": "GET",  "path": "/templates",         "query": "doc_type, agency", "desc": "List templates" },
             { "method": "POST", "path": "/templates",         "body": "TemplateCreateRequest", "desc": "Register a template by file path" },
             { "method": "POST", "path": "/templates/upload",  "body": "multipart (file, doc_type, name)", "desc": "Upload a .docx render template" },
@@ -1735,6 +1755,84 @@ async fn export_general_pdf(
     }))
 }
 
+/// Locate the searchable-PDF sidecar script (resolved like the docx renderer).
+fn searchable_pdf_script() -> Option<PathBuf> {
+    if let Some(path) = optional_env("GOVDOC_SEARCHABLE_PDF_SCRIPT") {
+        return resolve_existing_path(&path);
+    }
+    resolve_existing_path("scripts/searchable_pdf_sidecar.py")
+}
+
+/// Export the ORIGINAL uploaded PDF as a searchable PDF: born-digital pages pass
+/// through untouched (crisp vector text), scanned pages get an invisible OCR
+/// text layer. Runs the PyMuPDF sidecar; needs python3 + fitz.
+async fn export_general_searchable_pdf(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<Json<RenderSaveResponse>, ApiError> {
+    let doc = {
+        let store = lock_store(&state)?;
+        store
+            .get_general_document(id)
+            .map_err(internal_error)?
+            .ok_or_else(|| not_found("general document", id))?
+    };
+    let source = FsPath::new(&doc.file_path);
+    if !source.exists() {
+        return Err(ApiError {
+            status: StatusCode::UNPROCESSABLE_ENTITY,
+            detail: format!("source PDF for document {id} is missing on disk"),
+        });
+    }
+    if source.extension().and_then(|e| e.to_str()).map(str::to_ascii_lowercase)
+        != Some("pdf".to_string())
+    {
+        return Err(ApiError {
+            status: StatusCode::UNPROCESSABLE_ENTITY,
+            detail: "searchable-PDF export only supports PDF sources".to_string(),
+        });
+    }
+    let script = searchable_pdf_script().ok_or_else(|| ApiError {
+        status: StatusCode::NOT_IMPLEMENTED,
+        detail: "searchable_pdf_sidecar.py not found; set GOVDOC_SEARCHABLE_PDF_SCRIPT".to_string(),
+    })?;
+
+    let dir = render_exports_dir();
+    std::fs::create_dir_all(&dir).map_err(io_error)?;
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let out_path = dir.join(format!("general-document-{millis}-searchable.pdf"));
+
+    let output = Command::new("python3")
+        .arg(&script)
+        .arg(source)
+        .arg(&out_path)
+        .arg("tha+eng")
+        .output()
+        .map_err(|err| ApiError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            detail: format!("failed to run searchable-PDF sidecar (is python3+fitz installed?): {err}"),
+        })?;
+    if !output.status.success() {
+        let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(ApiError {
+            status: StatusCode::BAD_GATEWAY,
+            detail: if detail.is_empty() {
+                "searchable-PDF sidecar failed".to_string()
+            } else {
+                detail
+            },
+        });
+    }
+    let bytes = std::fs::metadata(&out_path).map(|m| m.len() as usize).map_err(io_error)?;
+    Ok(Json(RenderSaveResponse {
+        file_path: out_path.display().to_string(),
+        bytes,
+    }))
+}
+
 fn lock_store(state: &AppState) -> Result<std::sync::MutexGuard<'_, SqliteStore>, ApiError> {
     state.template_store.lock().map_err(|_| ApiError {
         status: StatusCode::INTERNAL_SERVER_ERROR,
@@ -2669,24 +2767,14 @@ fn build_simple_docx(
         ));
         let page_blocks = blocks_for_page(blocks, page.page_number);
         if page_blocks.is_empty() {
-            for line in page_text(page).lines() {
-                body.push_str(&docx_paragraph(line, false));
-            }
+            body.push_str(&render_block_docx(&page_text(page), "paragraph"));
         } else {
             for block in page_blocks {
                 let text = block.text.as_deref().unwrap_or("").trim();
                 if text.is_empty() {
                     continue;
                 }
-                match block.block_type.as_str() {
-                    "heading" => body.push_str(&docx_paragraph(text, true)),
-                    "table" | "table_cell" => body.push_str(&docx_table_or_paragraph(text)),
-                    _ => {
-                        for line in text.lines() {
-                            body.push_str(&docx_paragraph(line, false));
-                        }
-                    }
-                }
+                body.push_str(&render_block_docx(text, &block.block_type));
             }
         }
     }
@@ -2736,11 +2824,185 @@ fn docx_paragraph(text: &str, heading: bool) -> String {
     }
 }
 
-fn docx_table_or_paragraph(text: &str) -> String {
+// Render one OCR block (whose text may be Markdown with embedded HTML tables)
+// into DOCX body XML: HTML tables become real Word tables, `#` headings become
+// heading paragraphs, ``` fences become monospace blocks, the rest paragraphs.
+// Thai (and any Unicode) is preserved — DOCX is UTF-8, unlike the legacy PDF.
+fn render_block_docx(text: &str, block_type: &str) -> String {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    if trimmed.contains("<table") {
+        return render_html_segments_docx(trimmed);
+    }
+    let mut out = String::new();
+    let mut lines = trimmed.lines().peekable();
+    while let Some(line) = lines.next() {
+        let line = line.trim_end();
+        if is_code_fence(line) {
+            // Collect everything up to the closing fence as a code block.
+            let mut code = Vec::new();
+            while let Some(next) = lines.peek() {
+                if is_code_fence(next.trim_end()) {
+                    lines.next();
+                    break;
+                }
+                code.push(lines.next().unwrap());
+            }
+            out.push_str(&docx_code_block(&code.join("\n")));
+            continue;
+        }
+        if line.trim().starts_with('|') {
+            // Gather a contiguous pipe-table block.
+            let mut rows = vec![line];
+            while let Some(next) = lines.peek() {
+                if next.trim().starts_with('|') {
+                    rows.push(lines.next().unwrap());
+                } else {
+                    break;
+                }
+            }
+            out.push_str(&pipe_table_to_docx(&rows.join("\n")));
+            continue;
+        }
+        if let Some((level, htext)) = parse_md_heading(line) {
+            out.push_str(&docx_heading(htext, level));
+        } else if line.trim().is_empty() {
+            continue;
+        } else if block_type == "heading" {
+            out.push_str(&docx_heading(line.trim(), 2));
+        } else {
+            out.push_str(&docx_paragraph(line.trim(), false));
+        }
+    }
+    out
+}
+
+fn is_code_fence(line: &str) -> bool {
+    let t = line.trim_start();
+    // Accept ``` and the curly-quote variants some OCR engines emit.
+    t.starts_with("```") || t.starts_with("‘‘‘") || t.starts_with("’’’")
+}
+
+fn parse_md_heading(line: &str) -> Option<(u8, &str)> {
+    let t = line.trim_start();
+    let hashes = t.chars().take_while(|&c| c == '#').count();
+    if (1..=6).contains(&hashes) {
+        let rest = t[hashes..].trim();
+        if !rest.is_empty() {
+            return Some((hashes as u8, rest));
+        }
+    }
+    None
+}
+
+fn docx_heading(text: &str, level: u8) -> String {
+    let style = format!("Heading{}", level.clamp(1, 6));
+    format!(
+        r#"<w:p><w:pPr><w:pStyle w:val="{style}"/></w:pPr><w:r><w:b/><w:t xml:space="preserve">{}</w:t></w:r></w:p>"#,
+        xml_escape(text)
+    )
+}
+
+fn docx_code_block(code: &str) -> String {
+    let mut xml = String::new();
+    for line in code.lines() {
+        xml.push_str(&format!(
+            r#"<w:p><w:pPr><w:shd w:val="clear" w:fill="F2F2F2"/></w:pPr><w:r><w:rPr><w:rFonts w:ascii="Courier New" w:hAnsi="Courier New"/></w:rPr><w:t xml:space="preserve">{}</w:t></w:r></w:p>"#,
+            xml_escape(line)
+        ));
+    }
+    xml
+}
+
+// Split a block's text into HTML `<table>…</table>` segments and the Markdown
+// text around them, rendering each appropriately.
+fn render_html_segments_docx(text: &str) -> String {
+    let mut out = String::new();
+    let mut rest = text;
+    while let Some(start) = rest.find("<table") {
+        let before = rest[..start].trim();
+        if !before.is_empty() {
+            out.push_str(&render_block_docx(before, "paragraph"));
+        }
+        let after = &rest[start..];
+        if let Some(end_rel) = after.find("</table>") {
+            let end = end_rel + "</table>".len();
+            out.push_str(&html_table_to_docx(&after[..end]));
+            rest = &after[end..];
+        } else {
+            out.push_str(&html_table_to_docx(after));
+            rest = "";
+            break;
+        }
+    }
+    let tail = rest.trim();
+    if !tail.is_empty() {
+        out.push_str(&render_block_docx(tail, "paragraph"));
+    }
+    out
+}
+
+const DOCX_TABLE_PR: &str = concat!(
+    "<w:tblPr><w:tblW w:w=\"0\" w:type=\"auto\"/><w:tblBorders>",
+    "<w:top w:val=\"single\" w:sz=\"4\" w:space=\"0\" w:color=\"auto\"/>",
+    "<w:left w:val=\"single\" w:sz=\"4\" w:space=\"0\" w:color=\"auto\"/>",
+    "<w:bottom w:val=\"single\" w:sz=\"4\" w:space=\"0\" w:color=\"auto\"/>",
+    "<w:right w:val=\"single\" w:sz=\"4\" w:space=\"0\" w:color=\"auto\"/>",
+    "<w:insideH w:val=\"single\" w:sz=\"4\" w:space=\"0\" w:color=\"auto\"/>",
+    "<w:insideV w:val=\"single\" w:sz=\"4\" w:space=\"0\" w:color=\"auto\"/>",
+    "</w:tblBorders></w:tblPr>"
+);
+
+fn html_table_to_docx(html: &str) -> String {
+    let rows = extract_html_elements(html, "tr");
+    if rows.is_empty() {
+        return docx_paragraph(&strip_html(html), false);
+    }
+    let mut xml = String::from("<w:tbl>");
+    xml.push_str(DOCX_TABLE_PR);
+    for row in &rows {
+        let mut cells = extract_html_elements(row, "td");
+        let headers = extract_html_elements(row, "th");
+        let is_header = cells.is_empty() && !headers.is_empty();
+        if is_header {
+            cells = headers;
+        }
+        if cells.is_empty() {
+            continue;
+        }
+        xml.push_str("<w:tr>");
+        for cell in cells {
+            let cell_text = strip_html(&cell);
+            let run = if is_header {
+                format!(
+                    r#"<w:r><w:rPr><w:b/></w:rPr><w:t xml:space="preserve">{}</w:t></w:r>"#,
+                    xml_escape(&cell_text)
+                )
+            } else {
+                format!(
+                    r#"<w:r><w:t xml:space="preserve">{}</w:t></w:r>"#,
+                    xml_escape(&cell_text)
+                )
+            };
+            xml.push_str(&format!(
+                r#"<w:tc><w:tcPr><w:tcW w:w="0" w:type="auto"/></w:tcPr><w:p>{run}</w:p></w:tc>"#
+            ));
+        }
+        xml.push_str("</w:tr>");
+    }
+    xml.push_str("</w:tbl>");
+    // Word requires a paragraph after a table.
+    xml.push_str("<w:p/>");
+    xml
+}
+
+fn pipe_table_to_docx(text: &str) -> String {
     let rows: Vec<Vec<String>> = text
         .lines()
         .map(str::trim)
-        .filter(|line| line.starts_with('|') && line.ends_with('|'))
+        .filter(|line| line.starts_with('|'))
         .map(|line| {
             line.trim_matches('|')
                 .split('|')
@@ -2759,18 +3021,66 @@ fn docx_table_or_paragraph(text: &str) -> String {
         return docx_paragraph(text, false);
     }
     let mut xml = String::from("<w:tbl>");
+    xml.push_str(DOCX_TABLE_PR);
     for row in rows {
         xml.push_str("<w:tr>");
         for cell in row {
             xml.push_str(&format!(
-                "<w:tc><w:p><w:r><w:t>{}</w:t></w:r></w:p></w:tc>",
+                r#"<w:tc><w:tcPr><w:tcW w:w="0" w:type="auto"/></w:tcPr><w:p><w:r><w:t xml:space="preserve">{}</w:t></w:r></w:p></w:tc>"#,
                 xml_escape(&cell)
             ));
         }
         xml.push_str("</w:tr>");
     }
     xml.push_str("</w:tbl>");
+    xml.push_str("<w:p/>");
     xml
+}
+
+// Return the inner content of every `<tag …>…</tag>` occurrence (non-nested).
+fn extract_html_elements(html: &str, tag: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let open_prefix = format!("<{tag}");
+    let close = format!("</{tag}>");
+    let mut rest = html;
+    while let Some(start) = rest.find(&open_prefix) {
+        let after_open = &rest[start..];
+        // Skip to the end of the opening tag '>'.
+        let Some(gt) = after_open.find('>') else {
+            break;
+        };
+        let content_start = gt + 1;
+        if let Some(end_rel) = after_open[content_start..].find(&close) {
+            let inner = &after_open[content_start..content_start + end_rel];
+            out.push(inner.to_string());
+            rest = &after_open[content_start + end_rel + close.len()..];
+        } else {
+            out.push(after_open[content_start..].to_string());
+            break;
+        }
+    }
+    out
+}
+
+// Strip any residual HTML tags and decode the handful of entities OCR emits.
+fn strip_html(html: &str) -> String {
+    let mut text = String::with_capacity(html.len());
+    let mut in_tag = false;
+    for c in html.chars() {
+        match c {
+            '<' => in_tag = true,
+            '>' => in_tag = false,
+            _ if !in_tag => text.push(c),
+            _ => {}
+        }
+    }
+    text.replace("&nbsp;", " ")
+        .replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .trim()
+        .to_string()
 }
 
 fn build_simple_pdf(
@@ -2779,6 +3089,12 @@ fn build_simple_pdf(
     blocks: &[GeneralDocumentBlock],
 ) -> Result<Vec<u8>, ApiError> {
     if let Some(bytes) = build_image_background_pdf(pages, blocks)? {
+        return Ok(bytes);
+    }
+    // Preferred path: build a proper DOCX (tables, headings, Thai intact) and
+    // let LibreOffice render it to PDF. Falls through to the dependency-free
+    // hand-rolled PDF below when soffice is unavailable.
+    if let Some(bytes) = build_pdf_via_libreoffice(filename, pages, blocks)? {
         return Ok(bytes);
     }
     let font_obj = 3 + (pages.len() * 2);
@@ -2825,6 +3141,49 @@ fn build_simple_pdf(
         objects.len() + 1
     ));
     Ok(pdf.into_bytes())
+}
+
+fn build_pdf_via_libreoffice(
+    filename: &str,
+    pages: &[GeneralDocumentPage],
+    blocks: &[GeneralDocumentBlock],
+) -> Result<Option<Vec<u8>>, ApiError> {
+    if !command_exists("soffice") {
+        return Ok(None);
+    }
+    let docx = build_simple_docx(filename, pages, blocks)?;
+    let base = std::env::temp_dir().join(format!(
+        "govdoc-soffice-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0)
+    ));
+    std::fs::create_dir_all(&base).map_err(io_error)?;
+    let docx_path = base.join("export.docx");
+    std::fs::write(&docx_path, &docx).map_err(io_error)?;
+    // A private user profile avoids clashing with a running LibreOffice instance.
+    let profile = base.join("profile");
+    let status = Command::new("soffice")
+        .arg(format!("-env:UserInstallation=file://{}", profile.display()))
+        .arg("--headless")
+        .arg("--convert-to")
+        .arg("pdf")
+        .arg("--outdir")
+        .arg(&base)
+        .arg(&docx_path)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map_err(io_error)?;
+    let pdf_path = base.join("export.pdf");
+    let result = if status.success() && pdf_path.exists() {
+        Some(std::fs::read(&pdf_path).map_err(io_error)?)
+    } else {
+        None
+    };
+    let _ = std::fs::remove_dir_all(&base);
+    Ok(result)
 }
 
 fn build_image_background_pdf(
@@ -3254,6 +3613,37 @@ mod tests {
         let pdf = build_simple_pdf("manual.pdf", &pages, &blocks).unwrap();
         assert!(docx.starts_with(b"PK"));
         assert!(pdf.starts_with(b"%PDF"));
+    }
+
+    #[test]
+    fn renders_markdown_and_html_table_to_docx() {
+        let out = render_block_docx(
+            "## หัวข้อ\n<table><tr><th>A</th><th>B</th></tr><tr><td>1</td><td>ไทย</td></tr></table>",
+            "paragraph",
+        );
+        // `##` heading becomes a styled heading with the marker stripped.
+        assert!(out.contains(r#"<w:pStyle w:val="Heading2"/>"#));
+        assert!(out.contains("หัวข้อ"));
+        assert!(!out.contains("##"));
+        // HTML table becomes a real Word table; raw tags must not leak through.
+        assert!(out.contains("<w:tbl>"));
+        assert!(!out.contains("<table"));
+        assert!(!out.contains("</td>"));
+        // Header cells are bold; Thai cell content is preserved (not ASCII-stripped).
+        assert!(out.contains("<w:b/>"));
+        assert!(out.contains("ไทย"));
+    }
+
+    #[test]
+    fn parses_headings_and_strips_html_entities() {
+        assert_eq!(parse_md_heading("# Title"), Some((1, "Title")));
+        assert_eq!(parse_md_heading("### A B"), Some((3, "A B")));
+        assert_eq!(parse_md_heading("plain text"), None);
+        assert_eq!(strip_html("<td>x &amp; <b>ไทย</b></td>"), "x & ไทย");
+        assert_eq!(
+            extract_html_elements("<tr><td>a</td><td>b</td></tr>", "td"),
+            vec!["a".to_string(), "b".to_string()]
+        );
     }
 
     #[tokio::test]

@@ -199,7 +199,7 @@ async function openDocument(id, { editing = false, row = null } = {}) {
 }
 
 async function deleteDocument(id) {
-  if (!confirm("ลบเอกสารนี้?")) return;
+  if (!(await confirmDialog("ลบเอกสารนี้?"))) return;
   await fetch(`${API}/documents/${id}`, { method: "DELETE" });
   loadDocuments();
 }

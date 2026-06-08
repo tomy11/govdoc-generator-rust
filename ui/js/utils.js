@@ -1,6 +1,48 @@
 // Pure-ish helpers shared across the official and general document flows:
 // form serialisation, document rendering, and bbox/page-range parsing.
 
+// The Tauri webview (WKWebView on macOS) does not implement the synchronous
+// window.confirm()/alert(), so they return falsy without showing anything —
+// which silently aborted the delete buttons. Use a native <dialog> instead
+// (showModal works in the webview, same as the create-document modal) and
+// resolve a Promise with the user's choice.
+function confirmDialog(message, { okLabel = "ลบ", okClass = "del" } = {}) {
+  return new Promise((resolve) => {
+    const dialog = document.createElement("dialog");
+    dialog.className = "confirm-dialog";
+    dialog.innerHTML = `
+      <section class="card modal-card">
+        <p class="confirm-message"></p>
+        <div class="row between confirm-actions">
+          <button type="button" class="ghost" data-confirm="cancel">ยกเลิก</button>
+          <button type="button" data-confirm="ok"></button>
+        </div>
+      </section>`;
+    dialog.querySelector(".confirm-message").textContent = message;
+    const okBtn = dialog.querySelector('[data-confirm="ok"]');
+    okBtn.textContent = okLabel;
+    if (okClass) okBtn.className = okClass;
+    document.body.appendChild(dialog);
+
+    const finish = (result) => {
+      if (dialog.open) dialog.close();
+      dialog.remove();
+      resolve(result);
+    };
+    dialog.querySelector('[data-confirm="cancel"]').addEventListener("click", () => finish(false));
+    okBtn.addEventListener("click", () => finish(true));
+    // Esc / backdrop click count as cancel.
+    dialog.addEventListener("cancel", (e) => {
+      e.preventDefault();
+      finish(false);
+    });
+    dialog.addEventListener("click", (e) => {
+      if (e.target === dialog) finish(false);
+    });
+    dialog.showModal();
+  });
+}
+
 function formToRequest(form) {
   const fd = new FormData(form);
   const req = {};
