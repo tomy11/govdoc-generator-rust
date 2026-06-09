@@ -1535,6 +1535,15 @@ async fn ocr_general_document(
     ensure_general_page_images_for_ocr(&state, id, &doc)?;
     let ocr = state.build_ocr()?;
 
+    // For born-digital PDFs, pull real per-line bounding boxes straight from the
+    // PDF text layer (Typhoon returns none). These power the block overlay; the
+    // page text/markdown still comes from Typhoon below.
+    let layout = FsPath::new(&doc.file_path)
+        .parent()
+        .and_then(FsPath::parent)
+        .map(|doc_dir| extract_pdf_layout(FsPath::new(&doc.file_path), &doc_dir.join("pages")))
+        .unwrap_or_default();
+
     for page in 1..=doc.page_count {
         {
             let store = lock_store(&state)?;
@@ -1569,7 +1578,10 @@ async fn ocr_general_document(
             .await
         {
             Ok(output) => {
-                let mut blocks = extract_general_blocks(id, page, &output.text, &output.raw_json);
+                let mut blocks = match layout.get(&page) {
+                    Some(lines) if !lines.is_empty() => layout_blocks(id, page, lines),
+                    _ => extract_general_blocks(id, page, &output.text, &output.raw_json),
+                };
                 embed_general_blocks(&state, &mut blocks).await?;
                 Ok((output, blocks))
             }
@@ -2222,6 +2234,111 @@ async fn embed_general_blocks(
         block.embedding = state.embed_for_storage(text).await?;
     }
     Ok(())
+}
+
+/// One text line lifted from a PDF's text layer (text + bbox in page-image px).
+#[derive(Clone, Debug)]
+struct LayoutLine {
+    text: String,
+    bbox_json: String,
+    block_type: String,
+}
+
+/// Resolve the PyMuPDF layout sidecar (text+bbox extractor).
+fn pdf_layout_script() -> Option<PathBuf> {
+    if let Some(path) = optional_env("GOVDOC_PDF_LAYOUT_SCRIPT") {
+        return resolve_existing_path(&path);
+    }
+    resolve_existing_path("scripts/pdf_layout_sidecar.py")
+}
+
+/// Run the layout sidecar over a PDF and return per-page text lines with bbox.
+/// Returns an empty map for non-PDF sources or any failure (caller then keeps
+/// its existing block-extraction path).
+fn extract_pdf_layout(
+    source: &FsPath,
+    pages_dir: &FsPath,
+) -> std::collections::HashMap<i64, Vec<LayoutLine>> {
+    let mut map = std::collections::HashMap::new();
+    if source
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(str::to_ascii_lowercase)
+        != Some("pdf".to_string())
+    {
+        return map;
+    }
+    let Some(script) = pdf_layout_script() else {
+        return map;
+    };
+    let Ok(output) = Command::new("python3")
+        .arg(&script)
+        .arg(source)
+        .arg(pages_dir)
+        .output()
+    else {
+        return map;
+    };
+    if !output.status.success() {
+        return map;
+    }
+    let Ok(value) = serde_json::from_slice::<Value>(&output.stdout) else {
+        return map;
+    };
+    let Some(pages) = value.get("pages").and_then(Value::as_object) else {
+        return map;
+    };
+    for (key, items) in pages {
+        let Ok(page_no) = key.parse::<i64>() else {
+            continue;
+        };
+        let Some(arr) = items.as_array() else {
+            continue;
+        };
+        let lines: Vec<LayoutLine> = arr
+            .iter()
+            .filter_map(|item| {
+                let text = item.get("text").and_then(Value::as_str)?.trim().to_string();
+                if text.is_empty() {
+                    return None;
+                }
+                let bbox_json = serde_json::to_string(item.get("bbox")?).ok()?;
+                let block_type = item
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .unwrap_or("text")
+                    .to_string();
+                Some(LayoutLine {
+                    text,
+                    bbox_json,
+                    block_type,
+                })
+            })
+            .collect();
+        if !lines.is_empty() {
+            map.insert(page_no, lines);
+        }
+    }
+    map
+}
+
+/// Build storable blocks (with real bbox) from PDF-layout lines.
+fn layout_blocks(document_id: i64, page_number: i64, lines: &[LayoutLine]) -> Vec<DraftGeneralBlock> {
+    lines
+        .iter()
+        .enumerate()
+        .map(|(index, line)| DraftGeneralBlock {
+            document_id,
+            page_number,
+            block_index: index as i64,
+            block_type: line.block_type.clone(),
+            text: Some(line.text.clone()),
+            bbox_json: Some(line.bbox_json.clone()),
+            style_json: None,
+            image_path: None,
+            embedding: None,
+        })
+        .collect()
 }
 
 fn extract_general_blocks(
